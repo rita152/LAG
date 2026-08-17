@@ -221,7 +221,7 @@ class TestJSBSimRunner:
         "--env-name SingleCombat --algorithm-name ppo --scenario-name 1v1/DodgeMissile/HierarchySelfplay",  # whether to use selfplay is optional
         "--env-name SingleCombat --algorithm-name ppo --scenario-name 1v1/DodgeMissile/HierarchyVsBaseline"])
     def test_training(self, args):
-        from scripts.train.train_jsbsim import make_train_env, make_eval_env, parse_args, get_config, Runner
+        from scripts.train.train_jsbsim import make_train_env, make_eval_env, parse_args, get_config, make_runner
         args += ' --experiment-name pytest --seed 1 --n-training-threads 1 --n-rollout-threads 5 --cuda' \
                 ' --log-interval 1 --save-interval 1 --use-eval --eval-interval 1 --eval-episodes 10' \
                 ' --num-mini-batch 5 --buffer-size 1000 --num-env-steps 1e4' \
@@ -266,12 +266,12 @@ class TestJSBSimRunner:
             "run_dir": run_dir
         }
 
-        # run experiments
-        runner = Runner(config)
-        runner.run()
-
-        # post process
-        envs.close()
+        try:
+            runner = make_runner(all_args, config)
+            runner.run()
+        finally:
+            envs.close()
+            eval_envs.close()
 
 
 class TestMultipleCombatEnv:

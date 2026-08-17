@@ -18,7 +18,7 @@ class Runner(object):
         self.envs = config['envs']
         self.eval_envs = config['eval_envs']
         self.device = config['device']
-        self.render_mode = config['render_mode']
+        self.render_mode = config.get('render_mode', 'txt')
         
         # Tacview render obj
         self.tacview = None
@@ -110,9 +110,15 @@ class Runner(object):
         torch.save(policy_critic.state_dict(), str(self.save_dir) + "/critic_latest.pt")
 
     def restore(self):
-        policy_actor_state_dict = torch.load(str(self.model_dir) + '/actor_latest.pt')
+        policy_actor_state_dict = torch.load(
+            str(self.model_dir) + '/actor_latest.pt',
+            weights_only=True,
+        )
         self.policy.actor.load_state_dict(policy_actor_state_dict)
-        policy_critic_state_dict = torch.load(str(self.model_dir) + '/critic_latest.pt')
+        policy_critic_state_dict = torch.load(
+            str(self.model_dir) + '/critic_latest.pt',
+            weights_only=True,
+        )
         self.policy.critic.load_state_dict(policy_critic_state_dict)
 
     def log_info(self, infos, total_num_steps):

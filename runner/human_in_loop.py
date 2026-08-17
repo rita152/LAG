@@ -13,7 +13,13 @@ import setproctitle
 from config import get_config
 from runner.share_jsbsim_runner import ShareJSBSimRunner
 from envs.JSBSim.envs import SingleCombatEnv, SingleControlEnv, MultipleCombatEnv
-from envs.env_wrappers import SubprocVecEnv, DummyVecEnv, ShareSubprocVecEnv, ShareDummyVecEnv
+from envs.env_wrappers import (
+    SubprocVecEnv,
+    DummyVecEnv,
+    ShareSubprocVecEnv,
+    ShareDummyVecEnv,
+    bind_current_process_to_rollout_cores,
+)
 from envs.JSBSim.human_agent.HumanAgent import HumanAgent
 from envs.JSBSim.tasks.heading_task import HeadingTask  
 from scripts.train.train_jsbsim import parse_args, make_train_env, make_eval_env
@@ -32,6 +38,12 @@ class HumanInLoop:
         """加载配置文件"""
         parser = get_config()
         all_args = parse_args(self.args, parser)
+        rollout_cpu_cores = bind_current_process_to_rollout_cores(all_args.n_rollout_threads)
+        if rollout_cpu_cores is not None:
+            logging.info(
+                "Bound human-control process to Linux CPU cores %s",
+                ",".join(map(str, rollout_cpu_cores)),
+            )
         return all_args
     
     def load_env(self):
@@ -88,6 +100,5 @@ class HumanInLoop:
                 # 打印完整的调用栈信息
                 logging.error("".join(traceback.format_exc()))
                 break  # 可选择退出循环
-
 
 

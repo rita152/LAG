@@ -13,11 +13,23 @@ import setproctitle
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
 from config import get_config
 from runner.share_jsbsim_runner import ShareJSBSimRunner
+from runner.jsbsim_runner import JSBSimRunner
+from runner.selfplay_jsbsim_runner import SelfplayJSBSimRunner
 from envs.JSBSim.envs import SingleCombatEnv, SingleControlEnv, MultipleCombatEnv
-from envs.env_wrappers import SubprocVecEnv, DummyVecEnv, ShareSubprocVecEnv, ShareDummyVecEnv
+from envs.env_wrappers import (
+    SubprocVecEnv,
+    DummyVecEnv,
+    ShareSubprocVecEnv,
+    ShareDummyVecEnv,
+    bind_current_process_to_rollout_cores,
+    get_rollout_cpu_cores,
+)
 from runner.tacview import Tacview
 
-def make_train_env(all_args):
+def make_train_env(all_args, cpu_affinity=None):
+    if cpu_affinity is None:
+        cpu_affinity = get_rollout_cpu_cores(all_args.n_rollout_threads)
+
     def get_env_fn(rank):
         def init_env():
             if all_args.env_name == "SingleCombat":
@@ -36,12 +48,18 @@ def make_train_env(all_args):
         if all_args.n_rollout_threads == 1:
             return ShareDummyVecEnv([get_env_fn(0)])
         else:
-            return ShareSubprocVecEnv([get_env_fn(i) for i in range(all_args.n_rollout_threads)])
+            return ShareSubprocVecEnv(
+                [get_env_fn(i) for i in range(all_args.n_rollout_threads)],
+                cpu_affinity=cpu_affinity,
+            )
     else:
         if all_args.n_rollout_threads == 1:
             return DummyVecEnv([get_env_fn(0)])
         else:
-            return SubprocVecEnv([get_env_fn(i) for i in range(all_args.n_rollout_threads)])
+            return SubprocVecEnv(
+                [get_env_fn(i) for i in range(all_args.n_rollout_threads)],
+                cpu_affinity=cpu_affinity,
+            )
 
 
 def make_eval_env(all_args):
@@ -81,9 +99,24 @@ def parse_args(args, parser):
     return all_args
 
 
+def make_runner(all_args, config):
+    """Create the runner that matches the selected environment and training mode."""
+    if all_args.env_name == "MultipleCombat":
+        return ShareJSBSimRunner(config)
+    if all_args.use_selfplay:
+        return SelfplayJSBSimRunner(config)
+    return JSBSimRunner(config)
+
+
 def main(args):
     parser = get_config()
     all_args = parse_args(args, parser)
+    rollout_cpu_cores = bind_current_process_to_rollout_cores(all_args.n_rollout_threads)
+    if rollout_cpu_cores is not None:
+        logging.info(
+            "Bound rollout process to Linux CPU cores %s",
+            ",".join(map(str, rollout_cpu_cores)),
+        )
 
     # seed
     np.random.seed(all_args.seed)
@@ -136,7 +169,7 @@ def main(args):
                               + "-" + str(all_args.experiment_name) + "@" + str(all_args.user_name))
 
     # env init
-    envs = make_train_env(all_args)
+    envs = make_train_env(all_args, cpu_affinity=rollout_cpu_cores)
     eval_envs = make_eval_env(all_args) if all_args.use_eval else None
 
     render_mode = all_args.render_mode
@@ -151,14 +184,7 @@ def main(args):
     }
 
     # run experiments
-    if all_args.env_name == "MultipleCombat":
-        runner = ShareJSBSimRunner(config)
-    else:
-        if all_args.use_selfplay:
-            from runner.selfplay_jsbsim_runner import SelfplayJSBSimRunner as Runner
-        else:
-            from runner.jsbsim_runner import JSBSimRunner as Runner
-        runner = Runner(config)
+    runner = make_runner(all_args, config)
     try:
         runner.run()
     except BaseException:
@@ -166,6 +192,8 @@ def main(args):
     finally:
         # post process
         envs.close()
+        if eval_envs is not None:
+            eval_envs.close()
 
         if all_args.use_wandb:
             run.finish()

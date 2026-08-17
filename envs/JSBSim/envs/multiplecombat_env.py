@@ -90,9 +90,11 @@ class MultipleCombatEnv(BaseEnv):
         ego_reward = np.mean([rewards[ego_id] for ego_id in self.ego_ids])
         enm_reward = np.mean([rewards[enm_id] for enm_id in self.enm_ids])
         for ego_id in self.ego_ids:
-            rewards[ego_id] = [ego_reward]
+            if self.agents[ego_id].is_alive:
+                rewards[ego_id] = [ego_reward]
         for enm_id in self.enm_ids:
-            rewards[enm_id] = [enm_reward]
+            if self.agents[enm_id].is_alive:
+                rewards[enm_id] = [enm_reward]
 
         dones = {}
         for agent_id in self.agents.keys():

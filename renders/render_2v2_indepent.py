@@ -53,8 +53,8 @@ ego_policy = PPOActor(args, env.observation_space, env.action_space, device=torc
 enm_policy = PPOActor(args, spaces.Box(low=-10, high=10., shape=(15,)), env.action_space, device=torch.device("cuda"))
 ego_policy.eval()
 enm_policy.eval()
-ego_policy.load_state_dict(torch.load(ego_run_dir + f"/actor_{ego_policy_index}.pt"))
-enm_policy.load_state_dict(torch.load(enm_run_dir + f"/actor_{enm_policy_index}.pt"))
+ego_policy.load_state_dict(torch.load(ego_run_dir + f"/actor_{ego_policy_index}.pt", weights_only=True))
+enm_policy.load_state_dict(torch.load(enm_run_dir + f"/actor_{enm_policy_index}.pt", weights_only=True))
 
 
 print("Start render")

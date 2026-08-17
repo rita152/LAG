@@ -308,7 +308,10 @@ class SelfplayJSBSimRunner(JSBSimRunner):
         opponent_idx = self.all_args.render_opponent_index
         dir_list = str(self.run_dir).split('/')
         file_path = '/'.join(dir_list[:dir_list.index('results')+1])
-        self.policy.actor.load_state_dict(torch.load(str(self.model_dir)+ f'/actor_{idx}.pt'))
+        self.policy.actor.load_state_dict(torch.load(
+            str(self.model_dir) + f'/actor_{idx}.pt',
+            weights_only=True,
+        ))
         self.policy.prep_rollout()
         self.eval_opponent_policy.actor.load_state_dict(torch.load(str(self.model_dir) + f'/actor_{opponent_idx}.pt',weights_only=True))
         self.eval_opponent_policy.prep_rollout()

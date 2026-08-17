@@ -17,17 +17,29 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath
 from config import get_config
 from runner.share_jsbsim_runner import ShareJSBSimRunner
 from envs.JSBSim.envs import SingleCombatEnv, SingleControlEnv, MultipleCombatEnv
-from envs.env_wrappers import SubprocVecEnv, DummyVecEnv, ShareSubprocVecEnv, ShareDummyVecEnv
+from envs.env_wrappers import (
+    SubprocVecEnv,
+    DummyVecEnv,
+    ShareSubprocVecEnv,
+    ShareDummyVecEnv,
+    bind_current_process_to_rollout_cores,
+)
 
 from envs.JSBSim.human_agent.HumanAgent import HumanAgent
 from envs.JSBSim.envs.singlecontrol_env import SingleControlEnv
 from envs.JSBSim.tasks.heading_task import HeadingTask  
 
-from scripts.train.train_jsbsim import parse_args, make_train_env,make_eval_env
+from scripts.train.train_jsbsim import parse_args
 from runner.tacview import Tacview
 def main(args):
     parser = get_config()
     all_args = parse_args(args, parser)
+    rollout_cpu_cores = bind_current_process_to_rollout_cores(all_args.n_rollout_threads)
+    if rollout_cpu_cores is not None:
+        logging.info(
+            "Bound human-control process to Linux CPU cores %s",
+            ",".join(map(str, rollout_cpu_cores)),
+        )
     
     # seed
     np.random.seed(all_args.seed)
@@ -78,18 +90,6 @@ def main(args):
 
     setproctitle.setproctitle(str(all_args.algorithm_name) + "-" + str(all_args.env_name)
                               + "-" + str(all_args.experiment_name) + "@" + str(all_args.user_name))
-
-    # env init
-    envs = make_train_env(all_args)
-    eval_envs = make_eval_env(all_args) if all_args.use_eval else None
-
-    config = {
-        "all_args": all_args,
-        "envs": envs,
-        "eval_envs": eval_envs,
-        "device": device,
-        "run_dir": run_dir
-    }
 
     # 你可以在这里传入你的配置或初始化环境
     

@@ -81,7 +81,7 @@ class BoxFlattener():
         self.space = ori_space
         assert isinstance(ori_space, gym.spaces.Box) \
             or isinstance(ori_space, gym.spaces.MultiDiscrete)
-        self.size = np.product(ori_space.shape)
+        self.size = int(np.prod(ori_space.shape))
 
     def __call__(self, observation):
         array = np.array(observation, copy=False)
@@ -118,7 +118,7 @@ class DiscreteFlattener():
             return array.reshape(-1, 1)
 
     def inv(self, observation):
-        array = np.array(observation, dtype=np.int, copy=False)
+        array = np.array(observation, dtype=int, copy=False)
         if array.size == 1:
             return array.item()
         else:

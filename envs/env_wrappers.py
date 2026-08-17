@@ -5,8 +5,85 @@ import os
 import contextlib
 import numpy as np
 from abc import ABC, abstractmethod
-from multiprocessing import Pipe, Process
+from multiprocessing import get_context
 from multiprocessing.connection import Connection
+from typing import Optional, Sequence, Tuple
+
+
+def _supports_cpu_affinity() -> bool:
+    return hasattr(os, "sched_getaffinity") and hasattr(os, "sched_setaffinity")
+
+
+def _validate_cpu_cores(cpu_cores: Sequence[int]) -> Tuple[int, ...]:
+    cores = tuple(int(core) for core in cpu_cores)
+    if not cores:
+        raise ValueError("CPU affinity requires at least one CPU core")
+    if len(set(cores)) != len(cores):
+        raise ValueError(f"CPU affinity cores must be unique, got {cores}")
+    if any(core < 0 for core in cores):
+        raise ValueError(f"CPU affinity cores must be non-negative, got {cores}")
+
+    if _supports_cpu_affinity():
+        available_cores = set(os.sched_getaffinity(0))
+        unavailable_cores = sorted(set(cores) - available_cores)
+        if unavailable_cores:
+            raise ValueError(
+                f"Requested CPU cores {unavailable_cores} are unavailable; "
+                f"available cores are {sorted(available_cores)}"
+            )
+    return cores
+
+
+def get_rollout_cpu_cores(num_rollout_threads: int) -> Optional[Tuple[int, ...]]:
+    """Return CPU cores 0 through ``num_rollout_threads - 1`` on Linux.
+
+    The returned mapping gives rollout worker ``i`` exclusive affinity to CPU
+    core ``i``. Platforms without ``sched_setaffinity`` retain their existing
+    scheduling behavior and return ``None``.
+    """
+    if num_rollout_threads < 1:
+        raise ValueError("--n-rollout-threads must be at least 1")
+    if not _supports_cpu_affinity():
+        return None
+    return _validate_cpu_cores(tuple(range(num_rollout_threads)))
+
+
+def bind_current_process_to_rollout_cores(num_rollout_threads: int) -> Optional[Tuple[int, ...]]:
+    """Bind the current Linux process to the CPU cores assigned to rollouts."""
+    cpu_cores = get_rollout_cpu_cores(num_rollout_threads)
+    if cpu_cores is not None:
+        os.sched_setaffinity(0, set(cpu_cores))
+    return cpu_cores
+
+
+def _bind_current_process_to_cpu_cores(cpu_cores: Optional[Sequence[int]]) -> None:
+    if cpu_cores is None or not _supports_cpu_affinity():
+        return
+    os.sched_setaffinity(0, set(_validate_cpu_cores(cpu_cores)))
+
+
+def _get_current_process_cpu_affinity() -> Optional[Tuple[int, ...]]:
+    if not _supports_cpu_affinity():
+        return None
+    return tuple(sorted(os.sched_getaffinity(0)))
+
+
+def _split_worker_cpu_affinities(
+    cpu_affinity: Optional[Sequence[int]], nenvs: int, in_series: int
+):
+    if cpu_affinity is None:
+        return [None] * (nenvs // in_series)
+
+    cpu_cores = _validate_cpu_cores(cpu_affinity)
+    if len(cpu_cores) != nenvs:
+        raise ValueError(
+            "CPU affinity must specify one core per rollout environment: "
+            f"expected {nenvs}, got {len(cpu_cores)}"
+        )
+    return [
+        cpu_cores[offset:offset + in_series]
+        for offset in range(0, nenvs, in_series)
+    ]
 
 
 class CloudpickleWrapper(object):
@@ -179,7 +256,7 @@ class DummyVecEnv(VecEnv):
             return np.stack(v)
 
 
-def worker(remote: Connection, parent_remote: Connection, env_fn_wrappers):
+def worker(remote: Connection, parent_remote: Connection, env_fn_wrappers, cpu_affinity=None):
     """Maintain an environment instance in subprocess,
     communicate with parent-process via multiprocessing.Pipe.
 
@@ -203,6 +280,7 @@ def worker(remote: Connection, parent_remote: Connection, env_fn_wrappers):
             raise NotImplementedError("Unexpected type of done!")
         return obs, reward, done, info
 
+    _bind_current_process_to_cpu_cores(cpu_affinity)
     parent_remote.close()
     envs = [env_fn_wrapper() for env_fn_wrapper in env_fn_wrappers.x]
     try:
@@ -219,6 +297,8 @@ def worker(remote: Connection, parent_remote: Connection, env_fn_wrappers):
                 remote.send(CloudpickleWrapper((envs[0].observation_space, envs[0].action_space)))
             elif cmd == 'get_num_agents':
                 remote.send(CloudpickleWrapper((getattr(envs[0], "num_agents", 1))))
+            elif cmd == 'get_cpu_affinity':
+                remote.send(_get_current_process_cpu_affinity())
             else:
                 raise NotImplementedError
     except KeyboardInterrupt:
@@ -233,13 +313,14 @@ class SubprocVecEnv(VecEnv):
     VecEnv that runs multiple environments in parallel in subproceses and communicates with them via pipes.
     Recommended to use when num_envs > 1 and step() can be a bottleneck.
     """
-    def __init__(self, env_fns, context='spawn', in_series=1):
+    def __init__(self, env_fns, context='spawn', in_series=1, cpu_affinity=None):
         """
         Args:
             env_fns: iterable of callables - functions that create environments to run in subprocesses. Need to be cloud-pickleable
             context (str, optional): Defaults to 'spawn'.
             in_series (int, optional): number of environments to run in series in a single process. Defaults to 1.
                 (e.g. when len(env_fns) == 12 and in_series == 3, it will run 4 processes, each running 3 envs in series)
+            cpu_affinity (Sequence[int], optional): CPU core assigned to each environment.
         """
         self.waiting = False
         self.closed = False
@@ -247,11 +328,17 @@ class SubprocVecEnv(VecEnv):
         nenvs = len(env_fns)
         assert nenvs % in_series == 0, "Number of envs must be divisible by number of envs to run in series"
         self.nremotes = nenvs // in_series
+        worker_cpu_affinities = _split_worker_cpu_affinities(cpu_affinity, nenvs, in_series)
         env_fns = np.array_split(env_fns, self.nremotes)
         # create Pipe connections to send/recv data from subprocesses,
-        self.remotes, self.work_remotes = zip(*[Pipe() for _ in range(self.nremotes)])
-        self.ps = [Process(target=worker, args=(work_remote, remote, CloudpickleWrapper(env_fn)))
-                   for (work_remote, remote, env_fn) in zip(self.work_remotes, self.remotes, env_fns)]
+        mp_context = get_context(context)
+        self.remotes, self.work_remotes = zip(*[mp_context.Pipe() for _ in range(self.nremotes)])
+        self.ps = [mp_context.Process(
+            target=worker,
+            args=(work_remote, remote, CloudpickleWrapper(env_fn), worker_cpu_affinity),
+        ) for (work_remote, remote, env_fn, worker_cpu_affinity) in zip(
+            self.work_remotes, self.remotes, env_fns, worker_cpu_affinities
+        )]
         for p in self.ps:
             p.daemon = True  # if the main process crashes, we should not cause things to hang
             with clear_mpi_env_vars():
@@ -288,6 +375,14 @@ class SubprocVecEnv(VecEnv):
         obss = [remote.recv() for remote in self.remotes]
         obss = self._flatten_series(obss)
         return self._flatten(obss)
+
+    def get_worker_cpu_affinities(self):
+        """Return the CPU affinity of each worker process for diagnostics."""
+        self._assert_not_closed()
+        assert not self.waiting, "Cannot query CPU affinity while a step is pending"
+        for remote in self.remotes:
+            remote.send(('get_cpu_affinity', None))
+        return [remote.recv() for remote in self.remotes]
 
     def close_extras(self):
         if self.waiting:
@@ -368,7 +463,7 @@ class ShareDummyVecEnv(DummyVecEnv, ShareVecEnv):
         return obs, share_obs
 
 
-def shareworker(remote: Connection, parent_remote: Connection, env_fn_wrappers):
+def shareworker(remote: Connection, parent_remote: Connection, env_fn_wrappers, cpu_affinity=None):
     """Maintain an environment instance in subprocess,
     communicate with parent-process via multiprocessing.Pipe.
 
@@ -392,6 +487,7 @@ def shareworker(remote: Connection, parent_remote: Connection, env_fn_wrappers):
             raise NotImplementedError("Unexpected type of done!")
         return obs, share_obs, reward, done, info
 
+    _bind_current_process_to_cpu_cores(cpu_affinity)
     parent_remote.close()
     envs = [env_fn_wrapper() for env_fn_wrapper in env_fn_wrappers.x]
     try:
@@ -408,6 +504,8 @@ def shareworker(remote: Connection, parent_remote: Connection, env_fn_wrappers):
                 remote.send(CloudpickleWrapper((envs[0].observation_space, envs[0].share_observation_space, envs[0].action_space)))
             elif cmd == 'get_num_agents':
                 remote.send(CloudpickleWrapper((getattr(envs[0], "num_agents", 1))))
+            elif cmd == 'get_cpu_affinity':
+                remote.send(_get_current_process_cpu_affinity())
             else:
                 raise NotImplementedError
     except KeyboardInterrupt:
@@ -418,18 +516,24 @@ def shareworker(remote: Connection, parent_remote: Connection, env_fn_wrappers):
 
 
 class ShareSubprocVecEnv(SubprocVecEnv, ShareVecEnv):
-    def __init__(self, env_fns, context='spawn', in_series=1):
+    def __init__(self, env_fns, context='spawn', in_series=1, cpu_affinity=None):
         self.waiting = False
         self.closed = False
         self.in_series = in_series
         nenvs = len(env_fns)
         assert nenvs % in_series == 0, "Number of envs must be divisible by number of envs to run in series"
         self.nremotes = nenvs // in_series
+        worker_cpu_affinities = _split_worker_cpu_affinities(cpu_affinity, nenvs, in_series)
         env_fns = np.array_split(env_fns, self.nremotes)
         # create Pipe connections to send/recv data from subprocesses,
-        self.remotes, self.work_remotes = zip(*[Pipe() for _ in range(self.nremotes)])
-        self.ps = [Process(target=shareworker, args=(work_remote, remote, CloudpickleWrapper(env_fn)))
-                   for (work_remote, remote, env_fn) in zip(self.work_remotes, self.remotes, env_fns)]
+        mp_context = get_context(context)
+        self.remotes, self.work_remotes = zip(*[mp_context.Pipe() for _ in range(self.nremotes)])
+        self.ps = [mp_context.Process(
+            target=shareworker,
+            args=(work_remote, remote, CloudpickleWrapper(env_fn), worker_cpu_affinity),
+        ) for (work_remote, remote, env_fn, worker_cpu_affinity) in zip(
+            self.work_remotes, self.remotes, env_fns, worker_cpu_affinities
+        )]
         for p in self.ps:
             p.daemon = True  # if the main process crashes, we should not cause things to hang
             with clear_mpi_env_vars():

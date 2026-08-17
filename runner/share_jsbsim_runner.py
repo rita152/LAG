@@ -360,7 +360,10 @@ class ShareJSBSimRunner(Runner):
         for policy in self.opponent_policy:
             choose_idx = self.selfplay_algo.choose(self.policy_pool)
             choose_opponents.append(choose_idx)
-            policy.actor.load_state_dict(torch.load(str(self.save_dir) + f'/actor_{choose_idx}.pt'))
+            policy.actor.load_state_dict(torch.load(
+                str(self.save_dir) + f'/actor_{choose_idx}.pt',
+                weights_only=True,
+            ))
             policy.prep_rollout()
         logging.info(f" Choose opponents {choose_opponents} for training")
 

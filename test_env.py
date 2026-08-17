@@ -60,11 +60,10 @@ def test_multi_env():
         end = time.time()
         # print(rewards)
         envs.render(mode='txt', filepath='JSBSimRecording.txt.acmi')
-        assert obs.shape == obs_shape and rewards.shape == reward_shape and dones.shape == done_shape and share_obs_shape
+        assert obs.shape == obs_shape and share_obs.shape == share_obs_shape \
+            and rewards.shape == reward_shape and dones.shape == done_shape
         if np.all(dones):
             break
         step += 1
 
     envs.close()
-
-test_multi_env()

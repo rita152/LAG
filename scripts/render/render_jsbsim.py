@@ -12,7 +12,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath
 from config import get_config
 from runner.share_jsbsim_runner import ShareJSBSimRunner
 from envs.JSBSim.envs import SingleCombatEnv, SingleControlEnv, MultipleCombatEnv
-from envs.env_wrappers import DummyVecEnv, ShareDummyVecEnv
+from envs.env_wrappers import DummyVecEnv, ShareDummyVecEnv, bind_current_process_to_rollout_cores
 
 
 def make_render_env(all_args):
@@ -52,6 +52,12 @@ def main(args):
     parser = get_config()
     all_args = parse_args(args, parser)
     assert all_args.model_dir is not None
+    rollout_cpu_cores = bind_current_process_to_rollout_cores(all_args.n_rollout_threads)
+    if rollout_cpu_cores is not None:
+        logging.info(
+            "Bound render process to Linux CPU cores %s",
+            ",".join(map(str, rollout_cpu_cores)),
+        )
     # seed
     np.random.seed(all_args.seed)
     random.seed(all_args.seed)

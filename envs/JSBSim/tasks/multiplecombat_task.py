@@ -131,7 +131,11 @@ class HierarchicalMultipleCombatTask(MultipleCombatTask):
     def __init__(self, config: str):
         super().__init__(config)
         self.lowlevel_policy = BaselineActor()
-        self.lowlevel_policy.load_state_dict(torch.load(get_root_dir() + '/model/baseline_model.pt', map_location=torch.device('cpu')))
+        self.lowlevel_policy.load_state_dict(torch.load(
+            get_root_dir() + '/model/baseline_model.pt',
+            map_location=torch.device('cpu'),
+            weights_only=True,
+        ))
         self.lowlevel_policy.eval()
         self.norm_delta_altitude = np.array([0.1, 0, -0.1])
         self.norm_delta_heading = np.array([-np.pi / 6, -np.pi / 12, 0, np.pi / 12, np.pi / 6])

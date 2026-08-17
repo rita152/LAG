@@ -12,7 +12,12 @@ import logging
 import setproctitle
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
 from config import get_config
-from envs.env_wrappers import SubprocVecEnv, DummyVecEnv
+from envs.env_wrappers import (
+    SubprocVecEnv,
+    DummyVecEnv,
+    bind_current_process_to_rollout_cores,
+    get_rollout_cpu_cores,
+)
 
 
 class GymEnv:
@@ -74,7 +79,10 @@ class GymHybridEnv(GymEnv):
         pass
 
 
-def make_train_env(all_args):
+def make_train_env(all_args, cpu_affinity=None):
+    if cpu_affinity is None:
+        cpu_affinity = get_rollout_cpu_cores(all_args.n_rollout_threads)
+
     def get_env_fn(rank):
         def init_env():
             env = gym.make(all_args.scenario_name)
@@ -85,7 +93,10 @@ def make_train_env(all_args):
     if all_args.n_rollout_threads == 1: 
         return DummyVecEnv([get_env_fn(0)])
     else:
-        return SubprocVecEnv([get_env_fn(i) for i in range(all_args.n_rollout_threads)])
+        return SubprocVecEnv(
+            [get_env_fn(i) for i in range(all_args.n_rollout_threads)],
+            cpu_affinity=cpu_affinity,
+        )
 
 def make_eval_env(all_args):
     def get_env_fn(rank):
@@ -121,6 +132,12 @@ def parse_args(args, parser):
 def main(args):
     parser = get_config()
     all_args = parse_args(args, parser)
+    rollout_cpu_cores = bind_current_process_to_rollout_cores(all_args.n_rollout_threads)
+    if rollout_cpu_cores is not None:
+        logging.info(
+            "Bound rollout process to Linux CPU cores %s",
+            ",".join(map(str, rollout_cpu_cores)),
+        )
 
     # seed
     np.random.seed(all_args.seed)
@@ -174,7 +191,7 @@ def main(args):
                               + "-" + str(all_args.experiment_name) + "@" + str(all_args.user_name))
 
     # env init
-    envs = make_train_env(all_args)
+    envs = make_train_env(all_args, cpu_affinity=rollout_cpu_cores)
     eval_envs = make_eval_env(all_args) if all_args.use_eval else None
 
     config = {
