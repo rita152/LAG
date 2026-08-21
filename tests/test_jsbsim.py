@@ -13,6 +13,22 @@ from envs.JSBSim.envs.multiplecombat_env import MultipleCombatEnv
 from envs.env_wrappers import DummyVecEnv, SubprocVecEnv, ShareDummyVecEnv, ShareSubprocVecEnv
 
 
+def _done(terminated, truncated):
+    return np.logical_or(terminated, truncated)
+
+
+def _reset_multiple(env):
+    obs, info = env.reset()
+    share_obs = env._pack(env.get_state())
+    return obs, share_obs, info
+
+
+def _step_multiple(env, actions):
+    obs, rewards, terminated, truncated, info = env.step(actions)
+    share_obs = env._pack(env.get_state())
+    return obs, share_obs, rewards, _done(terminated, truncated), info
+
+
 class TestSingleControlEnv:
 
     def test_env(self):
@@ -32,7 +48,8 @@ class TestSingleControlEnv:
 
         env.seed(0)
         action_space.seed(0)
-        obs = env.reset()
+        obs, reset_info = env.reset()
+        assert isinstance(reset_info, dict)
         assert obs.shape == obs_shape
 
         obs_buf = [obs]
@@ -41,7 +58,8 @@ class TestSingleControlEnv:
         done_buff = []
         while True:
             actions = np.array([action_space.sample() for _ in range(env.num_agents)])
-            obs, reward, done, info = env.step(actions)
+            obs, reward, terminated, truncated, info = env.step(actions)
+            done = _done(terminated, truncated)
             assert obs.shape == obs_shape and actions.shape == act_shape \
                 and reward.shape == reward_shape and done.shape == done_shape
             act_buf.append(actions)
@@ -54,11 +72,12 @@ class TestSingleControlEnv:
 
         # Repetition test (same seed => same data)
         env.seed(0)
-        obs = env.reset()
+        obs, reset_info = env.reset()
         t = 0
         assert np.linalg.norm(obs - obs_buf[t]) < 1e-8
         while t < len(done_buff):
-            obs, reward, done, info = env.step(act_buf[t])
+            obs, reward, terminated, truncated, info = env.step(act_buf[t])
+            done = _done(terminated, truncated)
             assert np.linalg.norm(obs - obs_buf[t + 1]) < 1e-8 \
                 and np.all(reward == rew_buf[t]) and np.all(done == done_buff[t])
             t += 1
@@ -74,12 +93,14 @@ class TestSingleControlEnv:
         reward_shape = (parallel_num, envs.num_agents, 1)
         done_shape = (parallel_num, envs.num_agents, 1)
 
-        obss = envs.reset()
+        obss, reset_infos = envs.reset()
+        assert reset_infos.shape == (parallel_num,)
         assert obss.shape == obs_shape
 
         actions = np.array([[envs.action_space.sample() for _ in range(envs.num_agents)] for _ in range(parallel_num)])
         while True:
-            obss, rewards, dones, infos = envs.step(actions)
+            obss, rewards, terminated, truncated, infos = envs.step(actions)
+            dones = _done(terminated, truncated)
             assert obss.shape == obs_shape and actions.shape == act_shape \
                 and rewards.shape == reward_shape and dones.shape == done_shape \
                 and infos.shape[0] == parallel_num and isinstance(infos[0], dict)
@@ -109,7 +130,7 @@ class TestSingleCombatEnv:
 
         env.seed(0)
         action_space.seed(0)
-        obs = env.reset()
+        obs, reset_info = env.reset()
         assert obs.shape == obs_shape
 
         obs_buf = [obs]
@@ -122,7 +143,8 @@ class TestSingleCombatEnv:
                 actions = [action_space.sample() for _ in range(env.num_agents)]
             else:
                 actions = np.array([action_space.sample() for _ in range(env.num_agents)])
-            obs, rewards, dones, info = env.step(actions)
+            obs, rewards, terminated, truncated, info = env.step(actions)
+            dones = _done(terminated, truncated)
             assert obs.shape == obs_shape and rewards.shape == reward_shape and dones.shape == done_shape
             # save previous data
             act_buf.append(actions)
@@ -135,11 +157,12 @@ class TestSingleCombatEnv:
 
         # Repetition test (same seed => same data)
         env.seed(0)
-        obs = env.reset()
+        obs, reset_info = env.reset()
         t = 0
         assert np.linalg.norm(obs - obs_buf[t]) < 1e-8
         while t < len(done_buff):
-            obs, rewards, dones, info = env.step(act_buf[t])
+            obs, rewards, terminated, truncated, info = env.step(act_buf[t])
+            dones = _done(terminated, truncated)
             assert np.linalg.norm(obs - obs_buf[t + 1]) < 1e-8 \
                 and np.all(rewards == rew_buf[t]) and np.all(dones == done_buff[t])
             t += 1
@@ -149,10 +172,11 @@ class TestSingleCombatEnv:
         # if no weapon, once enemy die, env terminate!
         env = SingleCombatEnv(config)
         env.seed(0)
-        obs = env.reset()
+        obs, reset_info = env.reset()
         env.agents[env.ego_ids[0]].crash()
         actions = np.array([env.action_space.sample() for _ in range(env.num_agents)])
-        obs, rewards, dones, info = env.step(actions)
+        obs, rewards, terminated, truncated, info = env.step(actions)
+        dones = _done(terminated, truncated)
         assert np.min(rewards) < -100  # crash reward!
         assert np.all(dones)
 
@@ -161,7 +185,7 @@ class TestSingleCombatEnv:
         # if has weapon, once enemy die, env terminate until no missile warning!
         env = SingleCombatEnv(config)
         env.seed(0)
-        obs = env.reset()
+        obs, reset_info = env.reset()
         crash_id = env.ego_ids[0]   # ego shotdown
         while True:
             # mannual crash
@@ -172,7 +196,8 @@ class TestSingleCombatEnv:
                 crash_obs = obs[0]
             actions = np.array([env.action_space.sample() for _ in range(env.num_agents)])
 
-            obs, rewards, dones, info = env.step(actions)
+            obs, rewards, terminated, truncated, info = env.step(actions)
+            dones = _done(terminated, truncated)
 
             if np.all(dones):
                 break
@@ -196,13 +221,14 @@ class TestSingleCombatEnv:
         reward_shape = (parallel_num, envs.num_agents, 1)
         done_shape = (parallel_num, envs.num_agents, 1)
 
-        obss = envs.reset()
+        obss, reset_infos = envs.reset()
         assert obss.shape == obs_shape
 
         # Legal action inputs: List / np.ndarray (first ego, then enm)
         actions = [[envs.action_space.sample() for _ in range(envs.num_agents)] for _ in range(parallel_num)]
         while True:
-            obss, rewards, dones, infos = envs.step(actions)
+            obss, rewards, terminated, truncated, infos = envs.step(actions)
+            dones = _done(terminated, truncated)
             # check parallel env's data type
             assert obss.shape == obs_shape and rewards.shape == reward_shape and dones.shape == done_shape \
                 and infos.shape[0] == parallel_num and isinstance(infos[0], dict)
@@ -225,7 +251,7 @@ class TestJSBSimRunner:
         args += ' --experiment-name pytest --seed 1 --n-training-threads 1 --n-rollout-threads 5 --cuda' \
                 ' --log-interval 1 --save-interval 1 --use-eval --eval-interval 1 --eval-episodes 10' \
                 ' --num-mini-batch 5 --buffer-size 1000 --num-env-steps 1e4' \
-                ' --lr 3e-4 --gamma 0.99 --ppo-epoch 4 --clip-params 0.2 --max-grad-norm 2 --entropy-coef 1e-3' \
+                ' --lr 3e-4 --gamma 0.99 --ppo-epoch 4 --clip-param 0.2 --max-grad-norm 2 --entropy-coef 1e-3' \
                 ' --hidden-size 32 --act-hidden-size 32 --recurrent-hidden-size 32 --recurrent-hidden-layers 1 --data-chunk-length 8'
         args = args.split(' ')
         parser = get_config()
@@ -242,7 +268,7 @@ class TestJSBSimRunner:
             device = torch.device("cuda:0")  # use cude mask to control using which GPU
             torch.set_num_threads(all_args.n_training_threads)
             torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.benchmark = False
         else:
             device = torch.device("cpu")
             torch.set_num_threads(all_args.n_training_threads)
@@ -294,7 +320,7 @@ class TestMultipleCombatEnv:
         # DataType test
         env.seed(0)
         env.action_space.seed(0)
-        obs, share_obs = env.reset()
+        obs, share_obs, reset_info = _reset_multiple(env)
         assert obs.shape == obs_shape and share_obs.shape == share_obs_shape
 
         obs_buf = [obs]
@@ -304,7 +330,7 @@ class TestMultipleCombatEnv:
         done_buff = []
         while True:
             actions = [env.action_space.sample() for _ in range(env.num_agents)]
-            obs, share_obs, rewards, dones, info = env.step(actions)
+            obs, share_obs, rewards, dones, info = _step_multiple(env, actions)
             assert obs.shape == obs_shape and rewards.shape == reward_shape and dones.shape == done_shape and share_obs_shape
             # save previous data
             obs_buf.append(obs)
@@ -318,12 +344,12 @@ class TestMultipleCombatEnv:
 
         # Repetition test (same seed => same data)
         env.seed(0)
-        obs, share_obs = env.reset()
+        obs, share_obs, reset_info = _reset_multiple(env)
         t = 0
         assert np.linalg.norm(obs - obs_buf[t]) < 1e-8 \
             and np.linalg.norm(share_obs - share_buf[t]) < 1e-8
         while t < len(done_buff):
-            obs, share_obs, rewards, dones, info = env.step(act_buf[t])
+            obs, share_obs, rewards, dones, info = _step_multiple(env, act_buf[t])
             assert np.linalg.norm(obs - obs_buf[t + 1]) < 1e-8 \
                 and np.linalg.norm(share_obs - share_buf[t+1]) < 1e-8 \
                 and np.all(rewards == rew_buf[t]) and np.all(dones == done_buff[t])
@@ -346,12 +372,16 @@ class TestMultipleCombatEnv:
             if env.current_step == 60:
                 env.agents[enemy1_id].crash()
 
-            obs, share_obs, rewards, dones, info = env.step(actions)
+            obs, share_obs, rewards, dones, info = _step_multiple(env, actions)
             rewards = env._unpack(rewards)
             dones = env._unpack(dones)
-            if env.current_step > 20:
+            if env.current_step == 21:
+                assert dones[partner_id] == True and rewards[partner_id] < -100
+            elif env.current_step > 21:
                 assert dones[partner_id] == True and rewards[partner_id] == 0.0
-                if env.current_step > 40:
+                if env.current_step == 41:
+                    assert dones[enemy0_id] == True and rewards[enemy0_id] < -100
+                elif env.current_step > 41:
                     assert dones[enemy0_id] == True and rewards[enemy0_id] == 0.0
             if env.current_step == 61:
                 assert np.all(list(dones.values()))
@@ -370,15 +400,19 @@ class TestMultipleCombatEnv:
                 from envs.JSBSim.core.simulatior import MissileSimulator
                 env.add_temp_simulator(MissileSimulator.create(env.agents[enemy1_id], env.agents[uid], uid="C0000"))
 
-            obs, share_obs, rewards, dones, info = env.step(actions)
+            obs, share_obs, rewards, dones, info = _step_multiple(env, actions)
             rewards = env._unpack(rewards)
             dones = env._unpack(dones)
-            if env.current_step > 20:
+            if env.current_step == 21:
+                assert dones[enemy0_id] == True and rewards[enemy0_id] < -100
+            elif env.current_step > 21:
                 assert dones[enemy0_id] == True and rewards[enemy0_id] == 0.0
-                if env.current_step > 40:
+                if env.current_step == 41:
+                    assert dones[enemy1_id] == True and rewards[enemy1_id] < -100
+                elif env.current_step > 41:
                     assert dones[enemy1_id] == True and rewards[enemy1_id] == 0.0
             if np.all(list(dones.values())):
-                assert not env._tempsims["C0000"].is_alive
+                assert "C0000" not in env._tempsims or not env._tempsims["C0000"].is_alive
                 break
 
     @pytest.mark.parametrize("vecenv, config", list(product(
@@ -394,11 +428,56 @@ class TestMultipleCombatEnv:
         done_shape = (parallel_num, envs.num_agents, 1)
 
         # DataType test
-        obs, share_obs = envs.reset()
+        obs, share_obs, reset_infos = envs.reset()
         assert obs.shape == obs_shape and share_obs.shape == share_obs_shape
         while True:
             actions = np.array([[envs.action_space.sample() for _ in range(envs.num_agents)] for _ in range(parallel_num)])
-            obs, share_obs, rewards, dones, info = envs.step(actions)
+            obs, share_obs, rewards, terminated, truncated, info = envs.step(actions)
+            dones = _done(terminated, truncated)
             assert obs.shape == obs_shape and rewards.shape == reward_shape and dones.shape == done_shape and share_obs_shape
             break
         envs.close()
+
+
+def test_mappo_selfplay_training_smoke(tmp_path):
+    from scripts.train.train_jsbsim import (
+        get_config,
+        make_runner,
+        make_train_env,
+        parse_args,
+    )
+
+    parser = get_config()
+    all_args = parse_args(
+        "--env-name MultipleCombat --algorithm-name mappo "
+        "--scenario-name 2v2/NoWeapon/Selfplay --experiment-name pytest-mappo "
+        "--seed 3 --n-training-threads 1 --n-rollout-threads 2 "
+        "--buffer-size 8 --num-env-steps 16 --ppo-epoch 1 "
+        "--num-mini-batch 2 --data-chunk-length 4 "
+        "--hidden-size 16 --act-hidden-size 16 --recurrent-hidden-size 16 "
+        "--recurrent-hidden-layers 1 --save-interval 1 --log-interval 1 "
+        "--use-selfplay --selfplay-algorithm sp --n-choose-opponents 1".split(),
+        parser,
+    )
+    envs = make_train_env(all_args)
+    try:
+        runner = make_runner(
+            all_args,
+            {
+                "all_args": all_args,
+                "envs": envs,
+                "eval_envs": None,
+                "device": torch.device("cpu"),
+                "run_dir": tmp_path,
+            },
+        )
+        runner.run()
+    finally:
+        envs.close()
+
+    assert (tmp_path / "metrics.jsonl").is_file()
+    checkpoint = torch.load(
+        tmp_path / "training_state_latest.pt", weights_only=False
+    )
+    assert checkpoint["total_num_steps"] == 16
+    assert set(checkpoint["extra"]["policy_pool"]) == {"initial", "0"}

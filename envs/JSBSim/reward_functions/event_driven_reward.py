@@ -11,6 +11,9 @@ class EventDrivenReward(BaseRewardFunction):
     """
     def __init__(self, config):
         super().__init__(config)
+        # Sparse transition events are already temporal differences. Applying
+        # potential shaping would create a compensating reward on the next step.
+        self.is_potential = False
 
     def get_reward(self, task, env, agent_id):
         """
@@ -24,11 +27,12 @@ class EventDrivenReward(BaseRewardFunction):
             (float): reward
         """
         reward = 0
-        if env.agents[agent_id].is_shotdown:
-            reward -= 200
-        elif env.agents[agent_id].is_crash:
-            reward -= 200
-        for missile in env.agents[agent_id].launch_missiles:
-            if missile.is_success:
+        for event in env._events:
+            if event["processed"] or event["agent_id"] != agent_id:
+                continue
+            if event["type"] in ("aircraft_shotdown", "aircraft_crash"):
+                reward -= 200
+            elif event["type"] == "missile_hit":
                 reward += 200
+            event["processed"] = True
         return self._process(reward, agent_id)

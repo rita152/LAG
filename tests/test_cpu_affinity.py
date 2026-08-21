@@ -22,11 +22,11 @@ class AffinityProbeEnv:
     observation_space = spaces.Box(low=-1, high=1, shape=(1,))
     action_space = spaces.Discrete(1)
 
-    def reset(self):
-        return np.zeros(1, dtype=np.float32)
+    def reset(self, *, seed=None, options=None):
+        return np.zeros(1, dtype=np.float32), {}
 
     def step(self, action):
-        return np.zeros(1, dtype=np.float32), 0.0, False, {}
+        return np.zeros(1, dtype=np.float32), 0.0, False, False, {}
 
     def close(self):
         pass
@@ -35,13 +35,8 @@ class AffinityProbeEnv:
 class SharedAffinityProbeEnv(AffinityProbeEnv):
     share_observation_space = spaces.Box(low=-1, high=1, shape=(1,))
 
-    def reset(self):
-        observation = super().reset()
-        return observation, observation
-
-    def step(self, action):
-        observation = np.zeros(1, dtype=np.float32)
-        return observation, observation, 0.0, False, {}
+    def get_state(self):
+        return np.zeros(1, dtype=np.float32)
 
 
 @pytest.mark.skipif(
@@ -56,10 +51,8 @@ class SharedAffinityProbeEnv(AffinityProbeEnv):
     ],
 )
 def test_rollout_workers_are_pinned_to_matching_cpu_cores(vec_env_class, env_class):
-    available_cores = set(os.sched_getaffinity(0))
+    available_cores = tuple(sorted(os.sched_getaffinity(0)))
     worker_count = min(4, len(available_cores))
-    if not set(range(worker_count)).issubset(available_cores):
-        pytest.skip("The first Linux CPU cores are not available to this process")
 
     cpu_cores = get_rollout_cpu_cores(worker_count)
     envs = vec_env_class([env_class for _ in cpu_cores], cpu_affinity=cpu_cores)
@@ -74,10 +67,11 @@ def test_rollout_workers_are_pinned_to_matching_cpu_cores(vec_env_class, env_cla
     not hasattr(os, "sched_getaffinity") or not hasattr(os, "sched_setaffinity"),
     reason="CPU affinity is only available on Linux",
 )
-def test_train_jsbsim_pins_twenty_rollout_workers_to_cpu_cores_zero_to_nineteen():
-    expected_cpu_cores = set(range(20))
-    if not expected_cpu_cores.issubset(os.sched_getaffinity(0)):
-        pytest.skip("CPU cores 0 through 19 are not available to this process")
+def test_train_jsbsim_pins_twenty_workers_without_restricting_main_process():
+    available_cpu_cores = tuple(sorted(os.sched_getaffinity(0)))
+    if len(available_cpu_cores) < 20:
+        pytest.skip("Fewer than twenty CPU cores are available to this process")
+    expected_cpu_cores = available_cpu_cores[:20]
 
     original_affinity = os.sched_getaffinity(0)
     envs = None
@@ -88,12 +82,12 @@ def test_train_jsbsim_pins_twenty_rollout_workers_to_cpu_cores_zero_to_nineteen(
             "--scenario-name", "1/heading",
             "--n-rollout-threads", "20",
         ], parser)
-        cpu_cores = bind_current_process_to_rollout_cores(all_args.n_rollout_threads)
-        assert set(cpu_cores) == expected_cpu_cores
-        assert os.sched_getaffinity(0) == expected_cpu_cores
+        cpu_cores = get_rollout_cpu_cores(all_args.n_rollout_threads)
+        assert cpu_cores == expected_cpu_cores
+        assert os.sched_getaffinity(0) == original_affinity
 
         envs = make_train_env(all_args, cpu_affinity=cpu_cores)
-        assert envs.get_worker_cpu_affinities() == [(core,) for core in range(20)]
+        assert envs.get_worker_cpu_affinities() == [(core,) for core in expected_cpu_cores]
     finally:
         if envs is not None:
             envs.close()

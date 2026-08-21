@@ -1,5 +1,18 @@
 import argparse
-from tokenize import group
+
+
+def _add_boolean_option(group, name, default, help_text):
+    """Add Python 3.8-compatible ``--foo`` / ``--no-foo`` flags."""
+    dest = name.replace("-", "_")
+    group.add_argument(f"--{name}", dest=dest, action="store_true", help=help_text)
+    negative_name = name[4:] if name.startswith("use-") else name
+    group.add_argument(
+        f"--no-{negative_name}",
+        dest=dest,
+        action="store_false",
+        help=f"Disable: {help_text}",
+    )
+    group.set_defaults(**{dest: default})
 
 
 def get_config():
@@ -67,7 +80,7 @@ def _get_prepare_config(parser: argparse.ArgumentParser):
     group.add_argument("--n-training-threads", type=int, default=1,
                        help="Number of torch threads for training (default 1)")
     group.add_argument("--n-rollout-threads", type=int, default=4,
-                       help="Number of parallel rollout environments; on Linux, worker i is pinned to CPU i (default 4)")
+                       help="Number of parallel rollout environments; Linux workers use available cpuset cores (default 4)")
     group.add_argument("--num-env-steps", type=float, default=1e7,
                        help='Number of environment steps to train (default: 1e7)')
     group.add_argument("--model-dir", type=str, default=None,
@@ -91,7 +104,9 @@ def _get_replaybuffer_config(parser: argparse.ArgumentParser):
         --use-proper-time-limits
             by default, the return value does consider limits of time. If set, compute returns with considering time limits factor.
         --use-gae
-            by default, use generalized advantage estimation. If set, do not use gae.
+            use generalized advantage estimation (enabled by default).
+        --no-gae
+            disable generalized advantage estimation.
         --gae-lambda <float>
             gae lambda parameter (default: 0.95)
     """
@@ -102,8 +117,12 @@ def _get_replaybuffer_config(parser: argparse.ArgumentParser):
                        help="maximum storage in the buffer.")
     group.add_argument("--use-proper-time-limits", action='store_true', default=False,
                        help='compute returns taking into account time limits')
-    group.add_argument("--use-gae", action='store_false', default=True,
-                       help='Whether to use generalized advantage estimation')
+    _add_boolean_option(
+        group,
+        "use-gae",
+        True,
+        "Use generalized advantage estimation",
+    )
     group.add_argument("--gae-lambda", type=float, default=0.95,
                        help='gae lambda parameter (default: 0.95)')
     return parser
@@ -143,7 +162,9 @@ def _get_recurrent_config(parser: argparse.ArgumentParser):
     """
     Recurrent parameters:
         --use-recurrent-policy
-            by default, use Recurrent Policy. If set, do not use.
+            use a recurrent policy (enabled by default).
+        --no-recurrent-policy
+            disable the recurrent policy.
         --recurrent-hidden-size <int>
             Dimension of hidden layers for recurrent layers (default 128).
         --recurrent-hidden-layers <int>
@@ -152,8 +173,12 @@ def _get_recurrent_config(parser: argparse.ArgumentParser):
             Time length of chunks used to train a recurrent_policy, default 10.
     """
     group = parser.add_argument_group("Recurrent parameters")
-    group.add_argument("--use-recurrent-policy", action='store_false', default=True,
-                       help='Whether to use a recurrent policy')
+    _add_boolean_option(
+        group,
+        "use-recurrent-policy",
+        True,
+        "Use a recurrent policy",
+    )
     group.add_argument("--recurrent-hidden-size", type=int, default=128,
                        help="Dimension of hidden layers for recurrent layers (default 128)")
     group.add_argument("--recurrent-hidden-layers", type=int, default=1,
@@ -191,7 +216,9 @@ def _get_ppo_config(parser: argparse.ArgumentParser):
         --entropy-coef <float>
             ppo entropy term coefficient (default: 0.01)
         --use-max-grad-norm
-            by default, use max norm of gradients. If set, do not use.
+            clip gradient norm (enabled by default).
+        --no-max-grad-norm
+            disable gradient clipping.
         --max-grad-norm <float>
             max norm of gradients (default: 0.5)
     """
@@ -208,8 +235,12 @@ def _get_ppo_config(parser: argparse.ArgumentParser):
                        help='ppo value loss coefficient (default: 1)')
     group.add_argument("--entropy-coef", type=float, default=0.01,
                        help='entropy term coefficient (default: 0.01)')
-    group.add_argument("--use-max-grad-norm", action='store_false', default=True,
-                       help="By default, use max norm of gradients. If set, do not use.")
+    _add_boolean_option(
+        group,
+        "use-max-grad-norm",
+        True,
+        "Clip gradients to the configured maximum norm",
+    )
     group.add_argument("--max-grad-norm", type=float, default=2,
                        help='max norm of gradients (default: 2)')
     return parser
@@ -226,6 +257,8 @@ def _get_selfplay_config(parser: argparse.ArgumentParser):
             number of different opponents chosen for rollout. (default 1)
         --init-elo <float>
             initial ELO for policy performance. (default 1000.0)
+        --selfplay-interval <int>
+            updates between adding a policy snapshot and resampling opponents.
     """
     group = parser.add_argument_group("Selfplay parameters")
     group.add_argument("--use-selfplay", action='store_true', default=False,
@@ -236,6 +269,8 @@ def _get_selfplay_config(parser: argparse.ArgumentParser):
                        help="number of different opponents chosen for rollout. (default 1)")
     group.add_argument('--init-elo', type=float, default=1000.0,
                        help="initial ELO for policy performance. (default 1000.0)")
+    group.add_argument('--selfplay-interval', type=int, default=1,
+                       help="updates between policy-pool refreshes (default 1)")
     return parser
 
 

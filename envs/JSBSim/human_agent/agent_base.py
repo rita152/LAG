@@ -59,6 +59,7 @@ class BaseAgent(ABC):
             info: 其他信息
         """
         action = self.get_action(agent_id)  # 获取代理的动作
-        next_state, reward, done, info = self.env.step(action)  # 在环境中执行动作
+        next_state, reward, terminated, truncated, info = self.env.step(action)
+        done = np.logical_or(terminated, truncated)
         self.state = next_state  # 更新代理的状态
         return next_state, reward, done, info

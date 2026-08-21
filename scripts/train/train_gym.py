@@ -15,7 +15,6 @@ from config import get_config
 from envs.env_wrappers import (
     SubprocVecEnv,
     DummyVecEnv,
-    bind_current_process_to_rollout_cores,
     get_rollout_cpu_cores,
 )
 
@@ -26,18 +25,22 @@ class GymEnv:
         self.action_shape = self.env.action_space.shape
         self.action_space = self.env.action_space
         self.observation_space = self.env.observation_space
+        self._seed = None
 
-    def reset(self):
-        observation = self.env.reset()
-        return np.array(observation).reshape((1, -1))
+    def reset(self, *, seed=None, options=None):
+        seed = self._seed if seed is None else seed
+        observation, info = self.env.reset(seed=seed, options=options)
+        self._seed = None
+        return np.array(observation).reshape((1, -1)), info
 
     def step(self, action):
         action = np.array(action).reshape(self.action_shape)
-        observation, reward, done, info = self.env.step(action)
+        observation, reward, terminated, truncated, info = self.env.step(action)
         observation = np.array(observation).reshape((1, -1))
-        done = np.array(done).reshape((1,-1))
+        terminated = np.array(terminated).reshape((1, -1))
+        truncated = np.array(truncated).reshape((1, -1))
         reward = np.array(reward).reshape((1, -1))
-        return observation, reward, done, info
+        return observation, reward, terminated, truncated, info
 
     def render(self, mode="human"):
         self.env.render(mode)
@@ -46,7 +49,8 @@ class GymEnv:
         self.env.close()
     
     def seed(self, seed=None):
-        return self.env.seed(seed)
+        self._seed = seed
+        return [seed]
     
 
 class GymHybridEnv(GymEnv):
@@ -57,20 +61,24 @@ class GymHybridEnv(GymEnv):
         self.continuous_dims = self.action_space[1].shape[0]
         self.action_shape = (self.discrete_dims+self.continuous_dims,)
         self.observation_space = self.env.observation_space
+        self._seed = None
     
-    def reset(self):
-        observation = self.env.reset()
-        return np.array(observation).reshape((1, -1))
+    def reset(self, *, seed=None, options=None):
+        seed = self._seed if seed is None else seed
+        observation, info = self.env.reset(seed=seed, options=options)
+        self._seed = None
+        return np.array(observation).reshape((1, -1)), info
 
     def step(self, action):
         action = np.array(action).reshape(self.action_shape)
         discrete_a, continuous_a = action[:self.discrete_dims].astype(np.int32), action[self.discrete_dims:]
         action = (discrete_a, continuous_a)
-        observation, reward, done, info = self.env.step(action)
+        observation, reward, terminated, truncated, info = self.env.step(action)
         observation = np.array(observation).reshape((1, -1))
-        done = np.array(done).reshape((1,-1))
+        terminated = np.array(terminated).reshape((1, -1))
+        truncated = np.array(truncated).reshape((1, -1))
         reward = np.array(reward).reshape((1, -1))
-        return observation, reward, done, info
+        return observation, reward, terminated, truncated, info
 
     def render(self, mode="human"):
         self.env.render(mode)
@@ -125,14 +133,14 @@ def parse_args(args, parser):
                        help="the max length of an episode")
     group.add_argument('--num-agents', type=int, default=1,
                        help="number of agents controlled by RL policy")
-    all_args = parser.parse_known_args(args)[0]
+    all_args = parser.parse_args(args)
     return all_args
 
 
 def main(args):
     parser = get_config()
     all_args = parse_args(args, parser)
-    rollout_cpu_cores = bind_current_process_to_rollout_cores(all_args.n_rollout_threads)
+    rollout_cpu_cores = get_rollout_cpu_cores(all_args.n_rollout_threads)
     if rollout_cpu_cores is not None:
         logging.info(
             "Bound rollout process to Linux CPU cores %s",
@@ -151,7 +159,7 @@ def main(args):
         device = torch.device("cuda:0")  # use cude mask to control using which GPU
         torch.set_num_threads(all_args.n_training_threads)
         torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark = False
     else:
         logging.info("choose to use cpu...")
         device = torch.device("cpu")
@@ -209,13 +217,14 @@ def main(args):
     else:
         from runner.jsbsim_runner import JSBSimRunner as Runner
     runner = Runner(config)
-    runner.run()
-
-    # post process
-    envs.close()
-
-    if all_args.use_wandb:
-        run.finish()
+    try:
+        runner.run()
+    finally:
+        envs.close()
+        if eval_envs is not None:
+            eval_envs.close()
+        if all_args.use_wandb:
+            run.finish()
 
 
 if __name__ == "__main__":

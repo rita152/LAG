@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 import sys
 import os
-import traceback
 import wandb
 import socket
 import torch
@@ -21,7 +20,6 @@ from envs.env_wrappers import (
     DummyVecEnv,
     ShareSubprocVecEnv,
     ShareDummyVecEnv,
-    bind_current_process_to_rollout_cores,
     get_rollout_cpu_cores,
 )
 from runner.tacview import Tacview
@@ -41,6 +39,9 @@ def make_train_env(all_args, cpu_affinity=None):
             else:
                 logging.error("Can not support the " + all_args.env_name + "environment.")
                 raise NotImplementedError
+            if isinstance(env, MultipleCombatEnv):
+                env.set_training_mode(True)
+            env.set_reward_gamma(all_args.gamma)
             env.seed(all_args.seed + rank * 1000)
             return env
         return init_env
@@ -74,6 +75,9 @@ def make_eval_env(all_args):
             else:
                 logging.error("Can not support the " + all_args.env_name + "environment.")
                 raise NotImplementedError
+            if isinstance(env, MultipleCombatEnv):
+                env.set_training_mode(False)
+            env.set_reward_gamma(all_args.gamma)
             env.seed(all_args.seed * 50000 + rank * 1000)
             return env
         return init_env
@@ -95,8 +99,20 @@ def parse_args(args, parser):
                        help="Which scenario to run on")
     group.add_argument('--render-mode', type=str, default='txt',
                        help="txt or real_time")
-    all_args = parser.parse_known_args(args)[0]
+    all_args = parser.parse_args(args)
     return all_args
+
+
+def run_and_close(runner, envs, eval_envs=None, wandb_run=None):
+    """Run training, always close resources, and preserve any failure status."""
+    try:
+        runner.run()
+    finally:
+        envs.close()
+        if eval_envs is not None:
+            eval_envs.close()
+        if wandb_run is not None:
+            wandb_run.finish()
 
 
 def make_runner(all_args, config):
@@ -111,7 +127,7 @@ def make_runner(all_args, config):
 def main(args):
     parser = get_config()
     all_args = parse_args(args, parser)
-    rollout_cpu_cores = bind_current_process_to_rollout_cores(all_args.n_rollout_threads)
+    rollout_cpu_cores = get_rollout_cpu_cores(all_args.n_rollout_threads)
     if rollout_cpu_cores is not None:
         logging.info(
             "Bound rollout process to Linux CPU cores %s",
@@ -130,7 +146,7 @@ def main(args):
         device = torch.device("cuda:0")  # use cude mask to control using which GPU
         torch.set_num_threads(all_args.n_training_threads)
         torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark = False
     else:
         logging.info("choose to use cpu...")
         device = torch.device("cpu")
@@ -185,18 +201,12 @@ def main(args):
 
     # run experiments
     runner = make_runner(all_args, config)
-    try:
-        runner.run()
-    except BaseException:
-        traceback.print_exc()
-    finally:
-        # post process
-        envs.close()
-        if eval_envs is not None:
-            eval_envs.close()
-
-        if all_args.use_wandb:
-            run.finish()
+    run_and_close(
+        runner,
+        envs,
+        eval_envs,
+        wandb_run=run if all_args.use_wandb else None,
+    )
 
 
 if __name__ == "__main__":

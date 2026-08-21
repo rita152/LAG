@@ -4,7 +4,7 @@ from envs.JSBSim.envs import SingleCombatEnv, SingleControlEnv, MultipleCombatEn
 from envs.env_wrappers import SubprocVecEnv, DummyVecEnv
 from envs.JSBSim.core.catalog import Catalog as c
 from algorithms.ppo.ppo_actor import PPOActor
-from gym import spaces
+from gymnasium import spaces
 import time
 import logging
 logging.basicConfig(level=logging.DEBUG)
@@ -27,13 +27,13 @@ def _t2n(x):
 
 def convert(obs):
     ego = 9
-    offset = 6
+    offset = 7
     assert len(obs[0]) == ego + offset * 3
-    single_obs = np.zeros((2,ego+offset))
+    single_obs = np.zeros((2, ego + offset - 1))
     single_obs[0][:ego] = obs[0][:ego]
-    single_obs[0][ego:] = obs[0][ego+offset:ego+2*offset] 
+    single_obs[0][ego:] = obs[0][ego+offset+1:ego+2*offset]
     single_obs[1][:ego] = obs[1][:ego]
-    single_obs[1][ego:] = obs[1][ego+2*offset:ego+3*offset]
+    single_obs[1][ego:] = obs[1][ego+2*offset+1:ego+3*offset]
     return single_obs 
 
 num_agents = 4
@@ -81,7 +81,8 @@ while True:
     actions = np.concatenate((ego_actions, enm_actions), axis=0)
     # Obser reward and next obs
     start = time.time()
-    obs, _, rewards, dones, infos = env.step(actions)
+    obs, rewards, terminated, truncated, infos = env.step(actions)
+    dones = np.logical_or(terminated, truncated)
     end = time.time()
     # print(f"Env step time: {end-start}")
     rewards = rewards[:num_agents // 2, ...]

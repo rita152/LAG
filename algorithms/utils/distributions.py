@@ -112,8 +112,12 @@ class BetaShootBernoulli(nn.Module):
         x = 100 - self.constraint(100-x) # constrain alpha, beta <=100
         alpha = 1 + x[:, 0].unsqueeze(-1)
         beta = 1 + x[:, 1].unsqueeze(-1)
-        alpha_0 = kwargs['alpha0']
-        beta_0 = kwargs['beta0']
+        alpha_0 = kwargs.get('alpha0')
+        beta_0 = kwargs.get('beta0')
+        if alpha_0 is None:
+            alpha_0 = torch.zeros_like(alpha)
+        if beta_0 is None:
+            beta_0 = torch.zeros_like(beta)
         # print(f"{alpha}, {beta}, {alpha_0}, {beta_0}")
         p = (alpha + alpha_0) / (alpha + alpha_0 + beta + beta_0)
         return FixedBernoulli(p)

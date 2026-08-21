@@ -75,6 +75,37 @@ class ReplayBuffer(Buffer):
         advantages = self.returns[:-1] - self.value_preds[:-1]  # type: np.ndarray
         return (advantages - advantages.mean()) / (advantages.std() + 1e-5)
 
+    @staticmethod
+    def _validate_action_log_probs(action_log_probs: np.ndarray, expected_shape) -> np.ndarray:
+        action_log_probs = np.asarray(action_log_probs)
+        if action_log_probs.shape != expected_shape:
+            raise ValueError(
+                "action_log_probs must contain one joint log-probability per sample: "
+                f"expected shape {expected_shape}, got {action_log_probs.shape}"
+            )
+        return action_log_probs
+
+    @staticmethod
+    def _validate_recurrent_batches(
+        buffer_size: int,
+        data_chunk_length: int,
+        data_chunks: int,
+        num_mini_batch: int,
+    ) -> None:
+        if data_chunk_length <= 0:
+            raise ValueError("data_chunk_length must be positive")
+        if buffer_size % data_chunk_length != 0:
+            raise ValueError(
+                f"buffer_size ({buffer_size}) must be divisible by data_chunk_length "
+                f"({data_chunk_length}) so RNN chunks cannot cross trajectory boundaries"
+            )
+        if num_mini_batch <= 0:
+            raise ValueError("num_mini_batch must be positive")
+        if data_chunks < num_mini_batch:
+            raise ValueError(
+                f"num_mini_batch ({num_mini_batch}) cannot exceed data chunks ({data_chunks})"
+            )
+
     def insert(self,
                obs: np.ndarray,
                actions: np.ndarray,
@@ -101,6 +132,9 @@ class ReplayBuffer(Buffer):
         self.actions[self.step] = actions.copy()
         self.rewards[self.step] = rewards.copy()
         self.masks[self.step + 1] = masks.copy()
+        action_log_probs = self._validate_action_log_probs(
+            action_log_probs, self.action_log_probs[self.step].shape
+        )
         self.action_log_probs[self.step] = action_log_probs.copy()
         self.value_preds[self.step] = value_preds.copy()
         self.rnn_states_actor[self.step + 1] = rnn_states_actor.copy()
@@ -138,32 +172,21 @@ class ReplayBuffer(Buffer):
         Args:
             next_value(np.ndarray): value predictions for the step after the last episode step.
         """
-        if self.use_proper_time_limits:
-            if self.use_gae:
-                self.value_preds[-1] = next_value
-                gae = 0
-                for step in reversed(range(self.rewards.shape[0])):
-                    td_delta = self.rewards[step] + self.gamma * self.value_preds[step + 1] * self.masks[step + 1] - self.value_preds[step]
-                    gae = td_delta + self.gamma * self.gae_lambda * self.masks[step + 1] * gae
-                    gae = gae * self.bad_masks[step + 1]
-                    self.returns[step] = gae + self.value_preds[step]
-            else:
-                self.returns[-1] = next_value
-                for step in reversed(range(self.rewards.shape[0])):
-                    self.returns[step] = (self.returns[step + 1] * self.gamma * self.masks[step + 1] + self.rewards[step]) \
-                        * self.bad_masks[step + 1] + (1 - self.bad_masks[step + 1]) * self.value_preds[step]
+        # Time-limit transitions are corrected in the runner by adding
+        # gamma * V(final_observation) to their reward before insertion. They
+        # can therefore use the same recurrence as true terminal transitions
+        # without bootstrapping from an auto-reset observation.
+        if self.use_gae:
+            self.value_preds[-1] = next_value
+            gae = 0
+            for step in reversed(range(self.rewards.shape[0])):
+                td_delta = self.rewards[step] + self.gamma * self.value_preds[step + 1] * self.masks[step + 1] - self.value_preds[step]
+                gae = td_delta + self.gamma * self.gae_lambda * self.masks[step + 1] * gae
+                self.returns[step] = gae + self.value_preds[step]
         else:
-            if self.use_gae:
-                self.value_preds[-1] = next_value
-                gae = 0
-                for step in reversed(range(self.rewards.shape[0])):
-                    td_delta = self.rewards[step] + self.gamma * self.value_preds[step + 1] * self.masks[step + 1] - self.value_preds[step]
-                    gae = td_delta + self.gamma * self.gae_lambda * self.masks[step + 1] * gae
-                    self.returns[step] = gae + self.value_preds[step]
-            else:
-                self.returns[-1] = next_value
-                for step in reversed(range(self.rewards.shape[0])):
-                    self.returns[step] = self.returns[step + 1] * self.gamma * self.masks[step + 1] + self.rewards[step]
+            self.returns[-1] = next_value
+            for step in reversed(range(self.rewards.shape[0])):
+                self.returns[step] = self.returns[step + 1] * self.gamma * self.masks[step + 1] + self.rewards[step]
 
     @staticmethod
     def recurrent_generator(buffer: Union[Buffer, List[Buffer]], num_mini_batch: int, data_chunk_length: int):
@@ -189,9 +212,7 @@ class ReplayBuffer(Buffer):
             and all([b.num_agents == num_agents for b in buffer]) \
             and all([isinstance(b, ReplayBuffer) for b in buffer]), \
             "Input buffers must has the same type and shape"
-        buffer_size = buffer_size * len(buffer)
-
-        assert n_rollout_threads * buffer_size >= data_chunk_length, (
+        assert n_rollout_threads * num_agents * buffer_size >= data_chunk_length, (
             "PPO requires the number of processes ({}) * buffer size ({}) * num_agents ({})"
             "to be greater than or equal to the number of "
             "data chunk length ({}).".format(n_rollout_threads, buffer_size, num_agents, data_chunk_length))
@@ -208,10 +229,17 @@ class ReplayBuffer(Buffer):
         rnn_states_critic = np.vstack([ReplayBuffer._cast(buf.rnn_states_critic[:-1]) for buf in buffer])
 
         # Get mini-batch size and shuffle chunk data
-        data_chunks = n_rollout_threads * buffer_size // data_chunk_length
-        mini_batch_size = data_chunks // num_mini_batch
+        data_chunks = (
+            len(buffer)
+            * n_rollout_threads
+            * num_agents
+            * (buffer_size // data_chunk_length)
+        )
+        ReplayBuffer._validate_recurrent_batches(
+            buffer_size, data_chunk_length, data_chunks, num_mini_batch
+        )
         rand = torch.randperm(data_chunks).numpy()
-        sampler = [rand[i * mini_batch_size:(i + 1) * mini_batch_size] for i in range(num_mini_batch)]
+        sampler = np.array_split(rand, num_mini_batch)
 
         for indices in sampler:
             obs_batch = []
@@ -239,7 +267,7 @@ class ReplayBuffer(Buffer):
                 rnn_states_actor_batch.append(rnn_states_actor[ind])
                 rnn_states_critic_batch.append(rnn_states_critic[ind])
 
-            L, N = data_chunk_length, mini_batch_size
+            L, N = data_chunk_length, len(indices)
 
             # These are all from_numpys of size (L, N, Dim)
             obs_batch = np.stack(obs_batch, axis=1)
@@ -298,7 +326,10 @@ class SharedReplayBuffer(ReplayBuffer):
         # NOTE: active_masks[t, :, i] represents whether agent[i] is alive in obs[t] .... differ in different agents
         self.active_masks = np.ones_like(self.masks)
         # pi(a)
-        self.action_log_probs = np.zeros((self.buffer_size, self.n_rollout_threads, self.num_agents, *act_shape), dtype=np.float32)
+        self.action_log_probs = np.zeros(
+            (self.buffer_size, self.n_rollout_threads, self.num_agents, 1),
+            dtype=np.float32,
+        )
         # V(o), R(o) while advantage = returns - value_preds
         self.value_preds = np.zeros((self.buffer_size + 1, self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
         self.returns = np.zeros((self.buffer_size + 1, self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
@@ -340,7 +371,29 @@ class SharedReplayBuffer(ReplayBuffer):
             self.active_masks[self.step + 1] = active_masks.copy()
         if available_actions is not None:
             pass
-        return super().insert(obs, actions, rewards, masks, action_log_probs, value_preds, rnn_states_actor, rnn_states_critic)
+        return super().insert(
+            obs,
+            actions,
+            rewards,
+            masks,
+            action_log_probs,
+            value_preds,
+            rnn_states_actor,
+            rnn_states_critic,
+            bad_masks=bad_masks,
+        )
+
+    @property
+    def advantages(self) -> np.ndarray:
+        raw_advantages = self.returns[:-1] - self.value_preds[:-1]
+        valid = self.active_masks[:-1] > 0.5
+        normalized = np.zeros_like(raw_advantages)
+        if np.any(valid):
+            valid_advantages = raw_advantages[valid]
+            normalized[valid] = (
+                valid_advantages - valid_advantages.mean()
+            ) / (valid_advantages.std() + 1e-5)
+        return normalized
 
     def after_update(self):
         self.active_masks[0] = self.active_masks[-1].copy()
@@ -362,7 +415,7 @@ class SharedReplayBuffer(ReplayBuffer):
                 old_action_log_probs_batch, advantages_batch, returns_batch, value_preds_batch, \
                 rnn_states_actor_batch, rnn_states_critic_batch)
         """
-        assert self.n_rollout_threads * self.buffer_size >= data_chunk_length, (
+        assert self.n_rollout_threads * self.num_agents * self.buffer_size >= data_chunk_length, (
             "PPO requires the number of processes ({}) * buffer size ({}) "
             "to be greater than or equal to the number of data chunk length ({}).".format(
                 self.n_rollout_threads, self.buffer_size, data_chunk_length))
@@ -381,10 +434,16 @@ class SharedReplayBuffer(ReplayBuffer):
         rnn_states_critic = self._cast(self.rnn_states_critic[:-1])
 
         # Get mini-batch size and shuffle chunk data
-        data_chunks = self.n_rollout_threads * self.buffer_size // data_chunk_length
-        mini_batch_size = data_chunks // num_mini_batch
+        data_chunks = (
+            self.n_rollout_threads
+            * self.num_agents
+            * (self.buffer_size // data_chunk_length)
+        )
+        self._validate_recurrent_batches(
+            self.buffer_size, data_chunk_length, data_chunks, num_mini_batch
+        )
         rand = torch.randperm(data_chunks).numpy()
-        sampler = [rand[i * mini_batch_size:(i + 1) * mini_batch_size] for i in range(num_mini_batch)]
+        sampler = np.array_split(rand, num_mini_batch)
 
         for indices in sampler:
             obs_batch = []
@@ -416,7 +475,7 @@ class SharedReplayBuffer(ReplayBuffer):
                 rnn_states_actor_batch.append(rnn_states_actor[ind])
                 rnn_states_critic_batch.append(rnn_states_critic[ind])
 
-            L, N = data_chunk_length, mini_batch_size
+            L, N = data_chunk_length, len(indices)
 
             # These are all from_numpys of size (L, N, Dim)
             obs_batch = np.stack(obs_batch, axis=1)

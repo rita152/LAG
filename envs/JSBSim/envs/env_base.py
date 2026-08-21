@@ -4,7 +4,7 @@ import gymnasium
 from gymnasium.utils import seeding
 import numpy as np
 from typing import Dict, Any, Tuple
-from ..core.simulatior import AircraftSimulator, BaseSimulator
+from ..core.simulatior import AircraftSimulator, BaseSimulator, MissileSimulator
 from ..tasks.task_base import BaseTask
 from ..utils.utils import parse_config
 
@@ -19,7 +19,7 @@ class BaseEnv(gymnasium.Env):
     aircraft control task with its own specific observation/action space and
     variables and agent_reward calculation.
     """
-    metadata = {"render.modes": ["human", "txt"]}
+    metadata = {"render_modes": ["human", "txt", "real_time"]}
 
     def __init__(self, config_name: str):
         # basic args
@@ -87,27 +87,34 @@ class BaseEnv(gymnasium.Env):
                     sim.enemies.append(s)
 
         self._tempsims = {}    # type: Dict[str, BaseSimulator]
+        self._events = []
 
     def add_temp_simulator(self, sim: BaseSimulator):
         self._tempsims[sim.uid] = sim
 
-    def reset(self) -> np.ndarray:
+    def set_reward_gamma(self, gamma: float):
+        self.task.set_reward_gamma(gamma)
+
+    def reset(self, *, seed=None, options=None):
         """Resets the state of the environment and returns an initial observation.
 
         Returns:
             obs (np.ndarray): initial observation
         """
+        if seed is not None:
+            self.seed(seed)
         # reset sim
         self.current_step = 0
         for sim in self._jsbsims.values():
             sim.reload()
         self._tempsims.clear()
+        self._events = []
         # reset task
         self.task.reset(self)
         obs = self.get_obs()
-        return self._pack(obs)
+        return self._pack(obs), {}
 
-    def step(self, action: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    def step(self, action: np.ndarray):
         """Run one timestep of the environment's dynamics. When end of
         episode is reached, you are responsible for calling `reset()`
         to reset this environment's observation. Accepts an action and
@@ -125,6 +132,7 @@ class BaseEnv(gymnasium.Env):
         """
         self.current_step += 1
         info = {"current_step": self.current_step}
+        self._events = []
         # apply actions
         action = self._unpack(action)
         for agent_id in self.agents.keys():
@@ -134,23 +142,71 @@ class BaseEnv(gymnasium.Env):
         for _ in range(self.agent_interaction_steps):
             for sim in self._jsbsims.values():
                 sim.run()
-            for sim in self._tempsims.values():
+            for sim in list(self._tempsims.values()):
                 sim.run()
         self.task.step(self)
 
-        obs = self.get_obs()
-
-        dones = {}
+        terminated = {}
+        truncated = {}
         for agent_id in self.agents.keys():
             done, info = self.task.get_termination(self, agent_id, info)
-            dones[agent_id] = [done]
+            agent_truncated = bool(info.get("truncated", {}).get(agent_id, False))
+            terminated[agent_id] = [bool(done and not agent_truncated)]
+            truncated[agent_id] = [agent_truncated]
+
+        self._collect_events()
+        obs = self.get_obs()
 
         rewards = {}
         for agent_id in self.agents.keys():
             reward, info = self.task.get_reward(self, agent_id, info)
             rewards[agent_id] = [reward]
 
-        return self._pack(obs), self._pack(rewards), self._pack(dones), info
+        info["events"] = tuple(dict(event) for event in self._events)
+        self._prune_temp_simulators()
+
+        return (
+            self._pack(obs),
+            self._pack(rewards),
+            self._pack(terminated),
+            self._pack(truncated),
+            info,
+        )
+
+    def _collect_events(self):
+        """Collect simulator state transitions exactly once for this env step."""
+        for aircraft in self._jsbsims.values():
+            if aircraft.is_alive or aircraft.death_event_reported:
+                continue
+            event_type = "aircraft_shotdown" if aircraft.is_shotdown else "aircraft_crash"
+            self._events.append({
+                "type": event_type,
+                "agent_id": aircraft.uid,
+                "processed": False,
+            })
+            aircraft.death_event_reported = True
+
+        for missile in self._tempsims.values():
+            if not isinstance(missile, MissileSimulator):
+                continue
+            if missile.is_success and not missile.event_reported:
+                self._events.append({
+                    "type": "missile_hit",
+                    "agent_id": missile.parent_aircraft.uid,
+                    "target_id": missile.target_aircraft.uid,
+                    "missile_id": missile.uid,
+                    "processed": False,
+                })
+                missile.event_reported = True
+
+    def _prune_temp_simulators(self):
+        finished = [
+            uid
+            for uid, sim in self._tempsims.items()
+            if getattr(sim, "should_remove", False)
+        ]
+        for uid in finished:
+            self._tempsims.pop(uid).close()
 
     def get_obs(self):
         """Returns all agent observations in a list.
@@ -263,11 +319,12 @@ class BaseEnv(gymnasium.Env):
             data = np.concatenate((ego_data, enm_data))  # type: np.ndarray
         else:
             data = ego_data  # type: np.ndarray
-        try:
-            assert np.isnan(data).sum() == 0
-        except AssertionError:
-            import pdb
-            pdb.set_trace()
+        if not np.all(np.isfinite(data)):
+            invalid = np.argwhere(~np.isfinite(data))
+            raise FloatingPointError(
+                f"Non-finite environment data at step "
+                f"{getattr(self, 'current_step', '<reset>')}: indices={invalid.tolist()}"
+            )
         # only return data that belongs to RL agents
         return data[:self.num_agents, ...]
 

@@ -68,6 +68,10 @@ class BaseTask(ABC):
         """
         pass
 
+    def set_reward_gamma(self, gamma):
+        for reward_function in self.reward_functions:
+            reward_function.gamma = gamma
+
     def get_reward(self, env, agent_id, info={}) -> Tuple[float, dict]:
         """
         Aggregate reward functions

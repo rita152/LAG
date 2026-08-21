@@ -10,6 +10,64 @@ from multiprocessing.connection import Connection
 from typing import Optional, Sequence, Tuple
 
 
+def _unpack_reset(result):
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict):
+        return result
+    return result, {}
+
+
+def _unpack_step(result):
+    if len(result) == 5:
+        return result
+    if len(result) == 4:
+        obs, reward, done, info = result
+        return obs, reward, done, np.zeros_like(done, dtype=bool), info
+    raise ValueError(f"Environment step must return 5 values, got {len(result)}")
+
+
+def _episode_done(terminated, truncated):
+    if isinstance(terminated, dict):
+        done = [
+            bool(terminated[key]) or bool(truncated[key])
+            for key in terminated.keys()
+        ]
+        return bool(np.all(done))
+    return bool(np.all(np.logical_or(terminated, truncated)))
+
+
+def _step_env(env, action):
+    obs, reward, terminated, truncated, info = _unpack_step(env.step(action))
+    info = dict(info)
+    if _episode_done(terminated, truncated):
+        info["final_observation"] = obs
+        obs, reset_info = _unpack_reset(env.reset())
+        info["reset_info"] = reset_info
+    return obs, reward, terminated, truncated, info
+
+
+def _get_share_observation(env):
+    state = env.get_state()
+    return env._pack(state) if isinstance(state, dict) else state
+
+
+def _reset_shared_env(env):
+    obs, info = _unpack_reset(env.reset())
+    return obs, _get_share_observation(env), info
+
+
+def _step_shared_env(env, action):
+    obs, reward, terminated, truncated, info = _unpack_step(env.step(action))
+    share_obs = _get_share_observation(env)
+    info = dict(info)
+    if _episode_done(terminated, truncated):
+        info["final_observation"] = obs
+        info["final_share_observation"] = share_obs
+        obs, reset_info = _unpack_reset(env.reset())
+        share_obs = _get_share_observation(env)
+        info["reset_info"] = reset_info
+    return obs, share_obs, reward, terminated, truncated, info
+
+
 def _supports_cpu_affinity() -> bool:
     return hasattr(os, "sched_getaffinity") and hasattr(os, "sched_setaffinity")
 
@@ -35,7 +93,7 @@ def _validate_cpu_cores(cpu_cores: Sequence[int]) -> Tuple[int, ...]:
 
 
 def get_rollout_cpu_cores(num_rollout_threads: int) -> Optional[Tuple[int, ...]]:
-    """Return CPU cores 0 through ``num_rollout_threads - 1`` on Linux.
+    """Return the first available CPU IDs for rollout workers on Linux.
 
     The returned mapping gives rollout worker ``i`` exclusive affinity to CPU
     core ``i``. Platforms without ``sched_setaffinity`` retain their existing
@@ -45,7 +103,13 @@ def get_rollout_cpu_cores(num_rollout_threads: int) -> Optional[Tuple[int, ...]]
         raise ValueError("--n-rollout-threads must be at least 1")
     if not _supports_cpu_affinity():
         return None
-    return _validate_cpu_cores(tuple(range(num_rollout_threads)))
+    available_cores = tuple(sorted(os.sched_getaffinity(0)))
+    if num_rollout_threads > len(available_cores):
+        raise ValueError(
+            f"Requested {num_rollout_threads} rollout workers, but only "
+            f"{len(available_cores)} CPU cores are available: {available_cores}"
+        )
+    return _validate_cpu_cores(available_cores[:num_rollout_threads])
 
 
 def bind_current_process_to_rollout_cores(num_rollout_threads: int) -> Optional[Tuple[int, ...]]:
@@ -216,26 +280,21 @@ class DummyVecEnv(VecEnv):
         self.actions = actions
 
     def step_wait(self):
-        results = [env.step(a) for (a, env) in zip(self.actions, self.envs)]
-        obss, rewards, dones, infos = map(list, zip(*results))
-        for (i, done) in enumerate(dones):
-            if 'bool' in done.__class__.__name__:
-                if done:
-                    obss[i] = self.envs[i].reset()
-            elif isinstance(done, (list, tuple, np.ndarray)):
-                if np.all(done):
-                    obss[i] = self.envs[i].reset()
-            elif isinstance(done, dict):
-                if np.all(list(done.values())):
-                    obss[i] = self.envs[i].reset()
-            else:
-                raise NotImplementedError("Unexpected type of done!")
+        results = [_step_env(env, action) for action, env in zip(self.actions, self.envs)]
+        obss, rewards, terminated, truncated, infos = map(list, zip(*results))
         self.actions = None
-        return self._flatten(obss), self._flatten(rewards), self._flatten(dones), np.array(infos)
+        return (
+            self._flatten(obss),
+            self._flatten(rewards),
+            self._flatten(terminated),
+            self._flatten(truncated),
+            np.array(infos),
+        )
 
     def reset(self):
-        obss = [env.reset() for env in self.envs]
-        return self._flatten(obss)
+        results = [_unpack_reset(env.reset()) for env in self.envs]
+        obss, infos = zip(*results)
+        return self._flatten(obss), np.array(infos)
 
     def close(self):
         for env in self.envs:
@@ -265,21 +324,9 @@ def worker(remote: Connection, parent_remote: Connection, env_fn_wrappers, cpu_a
         parent_remote (Connection): used for mainprocess to send/receive data. [Need to be closed in subprocess!]
         env_fn_wrappers (method): functions to create gym.Env instance.
     """
-    def step_env(env, action):
-        obs, reward, done, info = env.step(action)
-        if 'bool' in done.__class__.__name__:
-            if done:
-                obs = env.reset()
-        elif isinstance(done, (list, tuple, np.ndarray)):
-            if np.all(done):
-                obs = env.reset()
-        elif isinstance(done, dict):
-            if np.all(list(done.values())):
-                obs = env.reset()
-        else:
-            raise NotImplementedError("Unexpected type of done!")
-        return obs, reward, done, info
+    import torch
 
+    torch.set_num_threads(1)
     _bind_current_process_to_cpu_cores(cpu_affinity)
     parent_remote.close()
     envs = [env_fn_wrapper() for env_fn_wrapper in env_fn_wrappers.x]
@@ -287,9 +334,9 @@ def worker(remote: Connection, parent_remote: Connection, env_fn_wrappers, cpu_a
         while True:
             cmd, data = remote.recv()
             if cmd == 'step':
-                remote.send([step_env(env, action) for env, action in zip(envs, data)])
+                remote.send([_step_env(env, action) for env, action in zip(envs, data)])
             elif cmd == 'reset':
-                remote.send([env.reset() for env in envs])
+                remote.send([_unpack_reset(env.reset()) for env in envs])
             elif cmd == 'close':
                 remote.close()
                 break
@@ -365,16 +412,23 @@ class SubprocVecEnv(VecEnv):
         results = [remote.recv() for remote in self.remotes]
         results = self._flatten_series(results)  # [[tuple] * in_series] * nremotes => [tuple] * nenvs
         self.waiting = False
-        obss, rewards, dones, infos = zip(*results)
-        return self._flatten(obss), self._flatten(rewards), self._flatten(dones), np.array(infos)
+        obss, rewards, terminated, truncated, infos = zip(*results)
+        return (
+            self._flatten(obss),
+            self._flatten(rewards),
+            self._flatten(terminated),
+            self._flatten(truncated),
+            np.array(infos),
+        )
 
     def reset(self):
         self._assert_not_closed()
         for remote in self.remotes:
             remote.send(('reset', None))
-        obss = [remote.recv() for remote in self.remotes]
-        obss = self._flatten_series(obss)
-        return self._flatten(obss)
+        results = [remote.recv() for remote in self.remotes]
+        results = self._flatten_series(results)
+        obss, infos = zip(*results)
+        return self._flatten(obss), np.array(infos)
 
     def get_worker_cpu_affinities(self):
         """Return the CPU affinity of each worker process for diagnostics."""
@@ -440,27 +494,25 @@ class ShareDummyVecEnv(DummyVecEnv, ShareVecEnv):
         self.num_agents = getattr(self.envs[0], "num_agents", 1)
 
     def step_wait(self):
-        results = [env.step(a) for (a, env) in zip(self.actions, self.envs)]
-        obs, share_obs, rews, dones, infos = map(list, zip(*results))
-        for (i, done) in enumerate(dones):
-            if 'bool' in done.__class__.__name__:
-                if done:
-                    obs[i], share_obs[i] = self.envs[i].reset()
-            elif isinstance(done, (list, tuple, np.ndarray)):
-                if np.all(done):
-                    obs[i], share_obs[i] = self.envs[i].reset()
-            elif isinstance(done, dict):
-                if np.all(list(done.values())):
-                    obs[i], share_obs[i] = self.envs[i].reset()
-            else:
-                raise NotImplementedError("Unexpected type of done!")
+        results = [
+            _step_shared_env(env, action)
+            for action, env in zip(self.actions, self.envs)
+        ]
+        obs, share_obs, rews, terminated, truncated, infos = map(list, zip(*results))
         self.actions = None
-        return self._flatten(obs), self._flatten(share_obs), self._flatten(rews), self._flatten(dones), np.array(infos)
+        return (
+            self._flatten(obs),
+            self._flatten(share_obs),
+            self._flatten(rews),
+            self._flatten(terminated),
+            self._flatten(truncated),
+            np.array(infos),
+        )
 
     def reset(self):
-        results = [env.reset() for env in self.envs]
-        obs, share_obs = map(np.array, zip(*results))
-        return obs, share_obs
+        results = [_reset_shared_env(env) for env in self.envs]
+        obs, share_obs, infos = map(np.array, zip(*results))
+        return obs, share_obs, infos
 
 
 def shareworker(remote: Connection, parent_remote: Connection, env_fn_wrappers, cpu_affinity=None):
@@ -472,21 +524,9 @@ def shareworker(remote: Connection, parent_remote: Connection, env_fn_wrappers, 
         parent_remote (Connection): used for mainprocess to send/receive data. [Need to be closed in subprocess!]
         env_fn_wrappers (method): functions to create gym.Env instance.
     """
-    def step_env(env, action):
-        obs, share_obs, reward, done, info = env.step(action)
-        if 'bool' in done.__class__.__name__:
-            if done:
-                obs, share_obs = env.reset()
-        elif isinstance(done, (list, tuple, np.ndarray)):
-            if np.all(done):
-                obs, share_obs = env.reset()
-        elif isinstance(done, dict):
-            if np.all(list(done.values())):
-                obs, share_obs = env.reset()
-        else:
-            raise NotImplementedError("Unexpected type of done!")
-        return obs, share_obs, reward, done, info
+    import torch
 
+    torch.set_num_threads(1)
     _bind_current_process_to_cpu_cores(cpu_affinity)
     parent_remote.close()
     envs = [env_fn_wrapper() for env_fn_wrapper in env_fn_wrappers.x]
@@ -494,9 +534,9 @@ def shareworker(remote: Connection, parent_remote: Connection, env_fn_wrappers, 
         while True:
             cmd, data = remote.recv()
             if cmd == 'step':
-                remote.send([step_env(env, action) for env, action in zip(envs, data)])
+                remote.send([_step_shared_env(env, action) for env, action in zip(envs, data)])
             elif cmd == 'reset':
-                remote.send([env.reset() for env in envs])
+                remote.send([_reset_shared_env(env) for env in envs])
             elif cmd == 'close':
                 remote.close()
                 break
@@ -553,8 +593,15 @@ class ShareSubprocVecEnv(SubprocVecEnv, ShareVecEnv):
         results = [remote.recv() for remote in self.remotes]
         results = self._flatten_series(results) # [[tuple] * in_series] * nremotes => [tuple] * nenvs
         self.waiting = False
-        obs, share_obs, rewards, dones, infos = zip(*results) 
-        return self._flatten(obs), self._flatten(share_obs), self._flatten(rewards), self._flatten(dones), np.array(infos)
+        obs, share_obs, rewards, terminated, truncated, infos = zip(*results)
+        return (
+            self._flatten(obs),
+            self._flatten(share_obs),
+            self._flatten(rewards),
+            self._flatten(terminated),
+            self._flatten(truncated),
+            np.array(infos),
+        )
 
     def reset(self):
         self._assert_not_closed()
@@ -562,5 +609,5 @@ class ShareSubprocVecEnv(SubprocVecEnv, ShareVecEnv):
             remote.send(('reset', None))
         results = [remote.recv() for remote in self.remotes]
         results = self._flatten_series(results)
-        obs, share_obs = zip(*results)
-        return self._flatten(obs), self._flatten(share_obs)
+        obs, share_obs, infos = zip(*results)
+        return self._flatten(obs), self._flatten(share_obs), np.array(infos)

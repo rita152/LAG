@@ -231,7 +231,10 @@ class HierarchicalSingleCombatTask(SingleCombatTask):
             input_obs[3:12] = raw_obs[:9]
             input_obs = np.expand_dims(input_obs, axis=0)
             # output low-level action
-            _action, _rnn_states = self.lowlevel_policy(input_obs, self._inner_rnn_states[agent_id])
+            with torch.inference_mode():
+                _action, _rnn_states = self.lowlevel_policy(
+                    input_obs, self._inner_rnn_states[agent_id]
+                )
             action = _action.detach().cpu().numpy().squeeze(0)
             self._inner_rnn_states[agent_id] = _rnn_states.detach().cpu().numpy()
             # normalize low-level action

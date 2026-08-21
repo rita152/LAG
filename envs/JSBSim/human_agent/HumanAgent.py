@@ -134,7 +134,8 @@ class HumanAgent(BaseAgent):
         Perform an action step in the environment based on the user input.
         """
         action = self.get_action()  # 获取动作
-        observation, reward, done, info = self.env.step(action)  # 执行动作
+        observation, reward, terminated, truncated, info = self.env.step(action)
+        done = np.logical_or(terminated, truncated)
         return observation, reward, done, info
     
     def reset(self):
@@ -143,8 +144,8 @@ class HumanAgent(BaseAgent):
         You can initialize the agent state here if needed.
         """
         # print("Resetting HumanAgent...")
-        self.env.reset()  # 调用环境的 reset 方法
-        return self.env.get_obs()  # 返回环境的初始观察状态
+        observation, _ = self.env.reset()
+        return observation
     
     def __del__(self):
         """析构函数，确保线程停止"""

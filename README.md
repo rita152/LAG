@@ -6,15 +6,23 @@ We provide a competitive environment for red and blue aircrafts games, which inc
 ## Install 
 
 ```shell
-# create python env
-conda create -n jsbsim python=3.8
-# install dependency
-pip install torch pymap3d jsbsim==1.1.6 geographiclib gym==0.20.0 wandb icecream setproctitle. 
+# The JSBSim aircraft data is a git submodule.
+git clone --recurse-submodules <repository-url>
+cd LAG
 
-- Download Shapely‑1.7.1‑cp38‑cp38‑win_amd64.whl from [here](https://www.lfd.uci.edu/~gohlke/pythonlibs/#shapely), and `pip install shaply` from local file.
+# Create the tested Python 3.8 / Gymnasium / Torch environment.
+conda env create -f environment.yml
+conda activate LAG
 
-- Initialize submodules(*JSBSim-Team/jsbsim*): `git submodule init; git submodule update`
+# If the repository was cloned without --recurse-submodules:
+git submodule update --init --recursive
+
+# Verify the installation and all training regressions.
+pytest -n auto
 ```
+
+The environment checks for `envs/JSBSim/data/aircraft/f16/f16.xml` at startup
+and reports a submodule-specific error when the aircraft data is missing.
 ## Envs
 We provide all task configs in  `envs/JSBSim/configs`, each config corresponds to a task.
 
@@ -61,11 +69,13 @@ We have provide scripts for five tasks in `scripts/`.
 It can be adapted to other tasks by modifying a few parameter settings. 
 
 - `--env-name` includes options ['SingleControl', 'SingleCombat', 'MultipleCombat'].
-- `--scenario` corresponds to yaml file in `envs/JBSim/configs` one by one.
-- `--algorithm` includes options [ppo, mappo], ppo for SingleControl and SingleCombat, mappo for MultipleCombat
+- `--scenario-name` corresponds to a YAML file in `envs/JSBSim/configs`.
+- `--algorithm-name` includes `ppo` and `mappo`: use PPO for SingleControl/SingleCombat and MAPPO for MultipleCombat.
 
 The description of parameter setting refers to `config.py`.
-Note that we set parameters `--use-selfplay --selfplay-algorithm --n-choose-opponents --use-eval --n-eval-rollout-threads --eval-interval --eval-episodes` in selfplay-setting training. `--use-prior` is only set true for shoot missile tasks.
+Self-play population refresh is controlled independently by `--selfplay-interval`;
+evaluation is optional and controlled by `--use-eval`, `--eval-interval`, and
+`--eval-episodes`. `--use-prior` is valid only for shoot-missile action spaces.
 We use wandb to track the training process. If you set `--use-wandb`, please replace the `--wandb-name` with your name. 
 
 ### Evaluate and Render

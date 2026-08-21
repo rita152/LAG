@@ -1,5 +1,6 @@
 import torch
 import logging
+import os
 import numpy as np
 from typing import List
 from .base_runner import Runner, ReplayBuffer
@@ -44,6 +45,8 @@ class SelfplayJSBSimRunner(JSBSimRunner):
             "Number of different opponents({}) must less than or equal to number of training threads({})!" \
             .format(self.num_opponents, self.n_rollout_threads)
         self.policy_pool = {}  # type: dict[str, float]
+        self.policy_snapshots = {}
+        self.current_opponent_ids = []
         self.opponent_policy = [
             Policy(self.all_args, self.obs_space, self.act_space, device=self.device)
             for _ in range(self.num_opponents)]
@@ -52,18 +55,85 @@ class SelfplayJSBSimRunner(JSBSimRunner):
         self.opponent_rnn_states = np.zeros_like(self.buffer.rnn_states_actor[0])
         self.opponent_masks = np.ones_like(self.buffer.masks[0])
 
-        if self.use_eval:
-            self.eval_opponent_policy = Policy(self.all_args, self.obs_space, self.act_space, device=self.device)
+        self.eval_opponent_policy = Policy(
+            self.all_args, self.obs_space, self.act_space, device=self.device
+        )
 
         logging.info("\n Load selfplay opponents: Algo {}, num_opponents {}.\n"
                         .format(self.all_args.selfplay_algorithm, self.num_opponents))
 
         if self.model_dir is not None:
             self.restore()
+        self._initialize_opponents()
+
+    @staticmethod
+    def _clone_actor_state(actor):
+        return {
+            key: value.detach().cpu().clone()
+            for key, value in actor.state_dict().items()
+        }
+
+    def _store_policy_snapshot(self, snapshot_id, elo):
+        snapshot_id = str(snapshot_id)
+        state = self._clone_actor_state(self.policy.actor)
+        self.policy_snapshots[snapshot_id] = state
+        self.policy_pool[snapshot_id] = float(elo)
+        torch.save(state, str(self.save_dir) + f"/actor_{snapshot_id}.pt")
+
+    def _load_policy_snapshot(self, policy, snapshot_id):
+        snapshot_id = str(snapshot_id)
+        if snapshot_id == "latest":
+            policy.actor.load_state_dict(self.policy.actor.state_dict())
+            policy.prep_rollout()
+            return
+        state = self.policy_snapshots.get(snapshot_id)
+        if state is None:
+            search_roots = [self.model_dir, self.save_dir]
+            for root in search_roots:
+                if root is None:
+                    continue
+                path = str(root) + f"/actor_{snapshot_id}.pt"
+                if not os.path.isfile(path):
+                    continue
+                state = torch.load(path, map_location=self.device, weights_only=True)
+                self.policy_snapshots[snapshot_id] = self._clone_state_dict(state)
+                break
+        if state is None:
+            raise FileNotFoundError(f"Missing actor snapshot {snapshot_id!r}")
+        policy.actor.load_state_dict(state)
+        policy.prep_rollout()
+
+    @staticmethod
+    def _clone_state_dict(state):
+        return {
+            key: value.detach().cpu().clone()
+            for key, value in state.items()
+        }
+
+    def _initialize_opponents(self):
+        if not self.policy_pool:
+            self._store_policy_snapshot("initial", self.init_elo)
+        elif not self.policy_snapshots:
+            for snapshot_id in self.policy_pool:
+                self._load_policy_snapshot(self.opponent_policy[0], snapshot_id)
+
+        if len(self.current_opponent_ids) != len(self.opponent_policy):
+            self.current_opponent_ids = [
+                self.selfplay_algo.choose(self.policy_pool)
+                for _ in self.opponent_policy
+            ]
+        for policy, snapshot_id in zip(
+            self.opponent_policy, self.current_opponent_ids
+        ):
+            self._load_policy_snapshot(policy, snapshot_id)
+
+    def update_opponent_pool(self, episode):
+        self._store_policy_snapshot(str(episode), self.latest_elo)
+        self.reset_opponent()
 
     def warmup(self):
         # reset env
-        obs = self.envs.reset()
+        obs, _ = self.envs.reset()
         # [Selfplay] divide ego/opponent of initial obs
         self.opponent_obs = obs[:, self.num_agents // 2:, ...]
         obs = obs[:, :self.num_agents // 2, ...]
@@ -100,27 +170,55 @@ class SelfplayJSBSimRunner(JSBSimRunner):
         return values, actions, action_log_probs, rnn_states_actor, rnn_states_critic
 
     def insert(self, data: List[np.ndarray]):
-        obs, actions, rewards, dones, action_log_probs, values, rnn_states_actor, rnn_states_critic = data
-
-        dones_env = np.all(dones.squeeze(axis=-1), axis=-1)
-
-        rnn_states_actor[dones_env == True] = np.zeros(((dones_env == True).sum(), *rnn_states_actor.shape[1:]), dtype=np.float32)
-        rnn_states_critic[dones_env == True] = np.zeros(((dones_env == True).sum(), *rnn_states_critic.shape[1:]), dtype=np.float32)
+        (
+            obs,
+            actions,
+            rewards,
+            terminated,
+            truncated,
+            infos,
+            action_log_probs,
+            values,
+            rnn_states_actor,
+            rnn_states_critic,
+        ) = data
+        rewards = self._bootstrap_time_limits(
+            rewards, truncated, infos, rnn_states_critic
+        )
+        dones = np.logical_or(terminated, truncated).squeeze(axis=-1)
+        controlled_agents = self.buffer.num_agents
+        controlled_dones = dones[:, :controlled_agents]
+        rnn_states_actor[controlled_dones] = 0.0
+        rnn_states_critic[controlled_dones] = 0.0
 
         masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
-        masks[dones_env == True] = np.zeros(((dones_env == True).sum(), self.num_agents, 1), dtype=np.float32)
+        masks[dones] = 0.0
+        bad_masks = np.ones_like(masks)
+        bad_masks[truncated.squeeze(axis=-1)] = 0.0
 
         # [Selfplay] divide ego/opponent of collecting data
         self.opponent_obs = obs[:, self.num_agents // 2:, ...]
         self.opponent_masks = masks[:, self.num_agents // 2:, ...]
-        self.opponent_rnn_states[dones_env == True] = np.zeros(((dones_env == True).sum(), *rnn_states_actor.shape[1:]), dtype=np.float32)
+        opponent_dones = dones[:, self.num_agents // 2:]
+        self.opponent_rnn_states[opponent_dones] = 0.0
         
         obs = obs[:, :self.num_agents // 2, ...]
         actions = actions[:, :self.num_agents // 2, ...]
         rewards = rewards[:, :self.num_agents // 2, ...]
         masks = masks[:, :self.num_agents // 2, ...]
+        bad_masks = bad_masks[:, :self.num_agents // 2, ...]
 
-        self.buffer.insert(obs, actions, rewards, masks, action_log_probs, values, rnn_states_actor, rnn_states_critic)
+        self.buffer.insert(
+            obs,
+            actions,
+            rewards,
+            masks,
+            action_log_probs,
+            values,
+            rnn_states_actor,
+            rnn_states_critic,
+            bad_masks,
+        )
 
     @torch.no_grad()
     def eval(self, total_num_steps):
@@ -142,15 +240,17 @@ class SelfplayJSBSimRunner(JSBSimRunner):
         while total_episodes < self.eval_episodes:
 
             # [Selfplay] Load opponent policy
-            if total_episodes >= eval_cur_opponent_idx * eval_each_episodes:
+            if (
+                eval_cur_opponent_idx < len(eval_choose_opponents)
+                and total_episodes >= eval_cur_opponent_idx * eval_each_episodes
+            ):
                 policy_idx = eval_choose_opponents[eval_cur_opponent_idx]
-                self.eval_opponent_policy.actor.load_state_dict(torch.load(str(self.save_dir) + f'/actor_{policy_idx}.pt', weights_only=True))
-                self.eval_opponent_policy.prep_rollout()
+                self._load_policy_snapshot(self.eval_opponent_policy, policy_idx)
                 eval_cur_opponent_idx += 1
                 logging.info(f" Load opponent {policy_idx} for evaluation ({total_episodes + 1}/{self.eval_episodes})")
 
                 # reset obs/rnn/mask
-                obs = self.eval_envs.reset()
+                obs, _ = self.eval_envs.reset()
                 masks = np.ones((self.n_eval_rollout_threads, *self.buffer.masks.shape[2:]), dtype=np.float32)
                 rnn_states = np.zeros((self.n_eval_rollout_threads, *self.buffer.rnn_states_actor.shape[2:]), dtype=np.float32)
                 opponent_obs = obs[:, self.num_agents // 2:, ...]
@@ -174,7 +274,8 @@ class SelfplayJSBSimRunner(JSBSimRunner):
             actions = np.concatenate((actions, opponent_actions), axis=1)
 
             # Obser reward and next obs
-            obs, eval_rewards, dones, eval_infos = self.eval_envs.step(actions)
+            obs, eval_rewards, terminated, truncated, eval_infos = self.eval_envs.step(actions)
+            dones = np.logical_or(terminated, truncated)
             dones_env = np.all(dones.squeeze(axis=-1), axis=-1)
             total_episodes += np.sum(dones_env)
 
@@ -216,11 +317,19 @@ class SelfplayJSBSimRunner(JSBSimRunner):
         # Compute average episode rewards
         episode_rewards = np.concatenate(episode_rewards) # shape (self.eval_episodes, self.num_agents, 1)
         episode_rewards = episode_rewards.squeeze(-1).mean(axis=-1) # shape: (self.eval_episodes,)
-        eval_average_episode_rewards = np.array(np.split(episode_rewards, self.num_opponents)).mean(axis=-1) # shape (self.num_opponents,)
+        eval_average_episode_rewards = np.array([
+            rewards.mean()
+            for rewards in np.array_split(episode_rewards, self.num_opponents)
+        ])
 
         opponent_episode_rewards = np.concatenate(opponent_episode_rewards)
         opponent_episode_rewards = opponent_episode_rewards.squeeze(-1).mean(axis=-1)
-        opponent_average_episode_rewards = np.array(np.split(opponent_episode_rewards, self.num_opponents)).mean(axis=-1)
+        opponent_average_episode_rewards = np.array([
+            rewards.mean()
+            for rewards in np.array_split(
+                opponent_episode_rewards, self.num_opponents
+            )
+        ])
 
         # Update elo
         '''
@@ -238,7 +347,7 @@ class SelfplayJSBSimRunner(JSBSimRunner):
             Ra = Ra + K * (outcome - Pa)
             Rb = Rb + K * ((1 - outcome) - Pb) = Rb + K * ((1 - outcome) - (1 - Pa)) = Rb + K * (Pa - outcome)
         '''
-        ego_elo = np.array([self.latest_elo for _ in range(self.n_eval_rollout_threads)])
+        ego_elo = float(self.latest_elo)
         opponent_elo = np.array([self.policy_pool[key] for key in eval_choose_opponents])
         expected_score = 1 / (1 + 10 ** ((opponent_elo - ego_elo) / 400))
 
@@ -248,46 +357,43 @@ class SelfplayJSBSimRunner(JSBSimRunner):
         actual_score[abs(diff) < 100] = 0.5 # tie
         actual_score[diff < -100] = 0 # lose
 
-        K = 32
-        update_opponent_elo = opponent_elo + K * (expected_score - actual_score)
-        for i, key in enumerate(eval_choose_opponents):
-            self.policy_pool[key] = update_opponent_elo[i]
-        update_ego_elo = ego_elo + K * (actual_score - expected_score)
-        self.latest_elo = update_ego_elo.mean()
+        self.latest_elo = self.selfplay_algo.update(
+            self.policy_pool,
+            {
+                "ego_elo": ego_elo,
+                "opponent_ids": eval_choose_opponents,
+                "actual_scores": actual_score.tolist(),
+            },
+        )
+        elo_gain = self.latest_elo - ego_elo
 
         # Logging
         eval_infos = {}
         eval_infos['eval_average_episode_rewards'] = eval_average_episode_rewards.mean()
         eval_infos['eval_opponent_average_episode_rewards'] = opponent_average_episode_rewards.mean()
-        eval_infos['eval_elo_gain'] = (K * (actual_score - expected_score)).mean()
+        eval_infos['eval_elo_gain'] = elo_gain
         eval_infos['latest_elo'] = self.latest_elo
-        logging.info(f" eval ego elo: {ego_elo.mean()} | opponent average elo: {opponent_elo.mean()}\n"
+        logging.info(f" eval ego elo: {ego_elo} | opponent average elo: {opponent_elo.mean()}\n"
                      f" ego average episode rewards: {eval_infos['eval_average_episode_rewards']}\n"
                      f" opponent average episode rewards: {eval_infos['eval_opponent_average_episode_rewards']}\n"
-                     f" elo gain: {(K * (actual_score - expected_score)).mean()} | latest elo score: {self.latest_elo}")
+                     f" elo gain: {elo_gain} | latest elo score: {self.latest_elo}")
         self.log_info(eval_infos, total_num_steps)
         logging.info("...End evaluation")
 
-        # [Selfplay] Reset opponent for the following training
-        self.reset_opponent()
-
     def save(self, episode):
-        policy_actor_state_dict = self.policy.actor.state_dict()
-        torch.save(policy_actor_state_dict, str(self.save_dir) + '/actor_latest.pt')
-        policy_critic_state_dict = self.policy.critic.state_dict()
-        torch.save(policy_critic_state_dict, str(self.save_dir) + '/critic_latest.pt')
-        # [Selfplay] save policy & performance
-        torch.save(policy_actor_state_dict, str(self.save_dir) + f'/actor_{episode}.pt')
-        self.policy_pool[str(episode)] = self.latest_elo
+        super().save(episode)
 
-    def reset_opponent(self):
+    def reset_opponent(self, reset_environment=True):
         choose_opponents = []
         for policy in self.opponent_policy:
             choose_idx = self.selfplay_algo.choose(self.policy_pool)
             choose_opponents.append(choose_idx)
-            policy.actor.load_state_dict(torch.load(str(self.save_dir) + f'/actor_{choose_idx}.pt', weights_only=True))
-            policy.prep_rollout()
+            self._load_policy_snapshot(policy, choose_idx)
+        self.current_opponent_ids = list(choose_opponents)
         logging.info(f" Choose opponents {choose_opponents} for training")
+
+        if not reset_environment:
+            return
 
         # clear buffer
         self.buffer.clear()
@@ -296,7 +402,7 @@ class SelfplayJSBSimRunner(JSBSimRunner):
         self.opponent_masks = np.ones_like(self.opponent_masks)
 
         # reset env
-        obs = self.envs.reset()
+        obs, _ = self.envs.reset()
         if self.num_opponents > 0:
             self.opponent_obs = obs[:, self.num_agents // 2:, ...]
             obs = obs[:, :self.num_agents // 2, ...]
@@ -313,11 +419,10 @@ class SelfplayJSBSimRunner(JSBSimRunner):
             weights_only=True,
         ))
         self.policy.prep_rollout()
-        self.eval_opponent_policy.actor.load_state_dict(torch.load(str(self.model_dir) + f'/actor_{opponent_idx}.pt',weights_only=True))
-        self.eval_opponent_policy.prep_rollout()
+        self._load_policy_snapshot(self.eval_opponent_policy, opponent_idx)
         logging.info("\nStart render ...")
         render_episode_rewards = 0
-        render_obs = self.envs.reset()
+        render_obs, _ = self.envs.reset()
         self.envs.render(mode='txt', filepath=f'{file_path}/{self.experiment_name}.txt.acmi')
         render_masks = np.ones((1, *self.buffer.masks.shape[2:]), dtype=np.float32)
         render_rnn_states = np.zeros((1, *self.buffer.rnn_states_actor.shape[2:]), dtype=np.float32)
@@ -342,7 +447,8 @@ class SelfplayJSBSimRunner(JSBSimRunner):
             render_opponent_rnn_states = np.expand_dims(_t2n(render_opponent_rnn_states), axis=0)
             render_actions = np.concatenate((render_actions, render_opponent_actions), axis=1)
             # Obser reward and next obs
-            render_obs, render_rewards, render_dones, render_infos = self.envs.step(render_actions)
+            render_obs, render_rewards, render_terminated, render_truncated, render_infos = self.envs.step(render_actions)
+            render_dones = np.logical_or(render_terminated, render_truncated)
             render_rewards = render_rewards[:, :self.num_agents // 2, ...]
             render_episode_rewards += render_rewards
             self.envs.render(mode='txt', filepath=f'{file_path}/{self.experiment_name}.txt.acmi')

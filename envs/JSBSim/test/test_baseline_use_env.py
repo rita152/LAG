@@ -140,7 +140,7 @@ class ManeuverAgent(BaselineAgent):
 
 def test_maneuver():
     env = SingleCombatEnv(config_name='1v1/NoWeapon/test/opposite')
-    obs = env.reset()
+    obs, _ = env.reset()
     env.render(filepath="control.txt.acmi")
     agent0 = ManeuverAgent(agent_id=0, maneuver='triangle')
     agent1 = PursueAgent(agent_id=1)
@@ -149,7 +149,8 @@ def test_maneuver():
         action0 = agent0.get_action(env, env.task)
         action1 = agent1.get_action(env, env.task)
         actions = [action0, action1]
-        obs, reward, done, info = env.step(actions)
+        obs, reward, terminated, truncated, info = env.step(actions)
+        done = np.logical_or(terminated, truncated)
         env.render(filepath="control.txt.acmi")
         reward_list.append(reward[0])
         if np.array(done).all():

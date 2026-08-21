@@ -67,7 +67,8 @@ while True:
     actions = np.concatenate((ego_actions, enm_actions), axis=0)
     # Obser reward and next obs
     start = time.time()
-    obs, _, rewards, dones, infos = env.step(actions)
+    obs, rewards, terminated, truncated, infos = env.step(actions)
+    dones = np.logical_or(terminated, truncated)
     end = time.time()
     # print(f"Env step time: {end-start}")
     rewards = rewards[:num_agents // 2, ...]

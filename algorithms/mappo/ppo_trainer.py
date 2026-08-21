@@ -31,6 +31,7 @@ class PPOTrainer():
             returns_batch, value_preds_batch, rnn_states_actor_batch, rnn_states_critic_batch = sample
 
         old_action_log_probs_batch = check(old_action_log_probs_batch).to(**self.tpdv)
+        active_masks_batch = check(active_masks_batch).to(**self.tpdv)
         advantages_batch = check(advantages_batch).to(**self.tpdv)
         returns_batch = check(returns_batch).to(**self.tpdv)
         value_preds_batch = check(value_preds_batch).to(**self.tpdv)
@@ -41,14 +42,17 @@ class PPOTrainer():
                                                                          rnn_states_actor_batch,
                                                                          rnn_states_critic_batch,
                                                                          actions_batch,
-                                                                         masks_batch)
+                                                                         masks_batch,
+                                                                         active_masks_batch)
 
         # Obtain the loss function
         ratio = torch.exp(action_log_probs - old_action_log_probs_batch)
         surr1 = ratio * advantages_batch
         surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * advantages_batch
-        policy_loss = torch.sum(torch.min(surr1, surr2), dim=-1, keepdim=True)
-        policy_loss = -policy_loss.mean()
+        valid_count = active_masks_batch.sum().clamp_min(1.0)
+        policy_loss = -(
+            torch.min(surr1, surr2) * active_masks_batch
+        ).sum() / valid_count
 
         if self.use_clipped_value_loss:
             value_pred_clipped = value_preds_batch + (values - value_preds_batch).clamp(-self.clip_param, self.clip_param)
@@ -57,9 +61,11 @@ class PPOTrainer():
             value_loss = 0.5 * torch.max(value_losses, value_losses_clipped)
         else:
             value_loss = 0.5 * (returns_batch - values).pow(2)
-        value_loss = value_loss.mean()
+        value_loss = (value_loss * active_masks_batch).sum() / valid_count
 
-        policy_entropy_loss = -dist_entropy.mean()
+        policy_entropy_loss = -(
+            dist_entropy * active_masks_batch
+        ).sum() / valid_count
 
         loss = policy_loss + value_loss * self.value_loss_coef + policy_entropy_loss * self.entropy_coef
 
@@ -74,7 +80,22 @@ class PPOTrainer():
             critic_grad_norm = get_gard_norm(policy.critic.parameters())
         policy.optimizer.step()
 
-        return policy_loss, value_loss, policy_entropy_loss, ratio, actor_grad_norm, critic_grad_norm
+        masked_kl = (
+            (old_action_log_probs_batch - action_log_probs) * active_masks_batch
+        ).sum() / valid_count
+        masked_clip_fraction = (
+            ((ratio - 1.0).abs() > self.clip_param).float() * active_masks_batch
+        ).sum() / valid_count
+        return (
+            policy_loss,
+            value_loss,
+            policy_entropy_loss,
+            ratio,
+            actor_grad_norm,
+            critic_grad_norm,
+            masked_kl,
+            masked_clip_fraction,
+        )
 
     def train(self, policy: PPOPolicy, buffer: SharedReplayBuffer):
         train_info = {}
@@ -84,6 +105,9 @@ class PPOTrainer():
         train_info['actor_grad_norm'] = 0
         train_info['critic_grad_norm'] = 0
         train_info['ratio'] = 0
+        train_info['approx_kl'] = 0
+        train_info['clip_fraction'] = 0
+        train_info['entropy'] = 0
 
         for _ in range(self.ppo_epoch):
             if self.use_recurrent_policy:
@@ -94,7 +118,7 @@ class PPOTrainer():
             for sample in data_generator:
 
                 policy_loss, value_loss, policy_entropy_loss, ratio, \
-                    actor_grad_norm, critic_grad_norm = self.ppo_update(policy, sample)
+                    actor_grad_norm, critic_grad_norm, approx_kl, clip_fraction = self.ppo_update(policy, sample)
 
                 train_info['value_loss'] += value_loss.item()
                 train_info['policy_loss'] += policy_loss.item()
@@ -102,6 +126,9 @@ class PPOTrainer():
                 train_info['actor_grad_norm'] += actor_grad_norm
                 train_info['critic_grad_norm'] += critic_grad_norm
                 train_info['ratio'] += ratio.mean().item()
+                train_info['approx_kl'] += approx_kl.item()
+                train_info['clip_fraction'] += clip_fraction.item()
+                train_info['entropy'] += -policy_entropy_loss.item()
 
         num_updates = self.ppo_epoch * self.num_mini_batch
 

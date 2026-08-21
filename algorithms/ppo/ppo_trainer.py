@@ -72,7 +72,18 @@ class PPOTrainer():
             critic_grad_norm = get_gard_norm(policy.critic.parameters())
         policy.optimizer.step()
 
-        return policy_loss, value_loss, policy_entropy_loss, ratio, actor_grad_norm, critic_grad_norm
+        approx_kl = (old_action_log_probs_batch - action_log_probs).mean()
+        clip_fraction = ((ratio - 1.0).abs() > self.clip_param).float().mean()
+        return (
+            policy_loss,
+            value_loss,
+            policy_entropy_loss,
+            ratio,
+            actor_grad_norm,
+            critic_grad_norm,
+            approx_kl,
+            clip_fraction,
+        )
 
     def train(self, policy: PPOPolicy, buffer: Union[ReplayBuffer, List[ReplayBuffer]]):
         train_info = {}
@@ -82,6 +93,9 @@ class PPOTrainer():
         train_info['actor_grad_norm'] = 0
         train_info['critic_grad_norm'] = 0
         train_info['ratio'] = 0
+        train_info['approx_kl'] = 0
+        train_info['clip_fraction'] = 0
+        train_info['entropy'] = 0
 
         for _ in range(self.ppo_epoch):
             if self.use_recurrent_policy:
@@ -92,7 +106,7 @@ class PPOTrainer():
             for sample in data_generator:
 
                 policy_loss, value_loss, policy_entropy_loss, ratio, \
-                    actor_grad_norm, critic_grad_norm = self.ppo_update(policy, sample)
+                    actor_grad_norm, critic_grad_norm, approx_kl, clip_fraction = self.ppo_update(policy, sample)
 
                 train_info['value_loss'] += value_loss.item()
                 train_info['policy_loss'] += policy_loss.item()
@@ -100,6 +114,9 @@ class PPOTrainer():
                 train_info['actor_grad_norm'] += actor_grad_norm
                 train_info['critic_grad_norm'] += critic_grad_norm
                 train_info['ratio'] += ratio.mean().item()
+                train_info['approx_kl'] += approx_kl.item()
+                train_info['clip_fraction'] += clip_fraction.item()
+                train_info['entropy'] += -policy_entropy_loss.item()
 
         num_updates = self.ppo_epoch * self.num_mini_batch
 

@@ -37,10 +37,9 @@ class JSBSimRunner(Runner):
         self.warmup()
 
         start = time.time()
-        self.total_num_steps = 0
         episodes = self.num_env_steps // self.buffer_size // self.n_rollout_threads
 
-        for episode in range(episodes):
+        for episode in range(self.start_episode, episodes):
 
             heading_turns_list = []
 
@@ -49,14 +48,25 @@ class JSBSimRunner(Runner):
                 values, actions, action_log_probs, rnn_states_actor, rnn_states_critic = self.collect(step)
 
                 # Obser reward and next obs
-                obs, rewards, dones, infos = self.envs.step(actions)
+                obs, rewards, terminated, truncated, infos = self.envs.step(actions)
 
                 # Extra recorded information
                 for info in infos:
                     if 'heading_turn_counts' in info:
                         heading_turns_list.append(info['heading_turn_counts'])
 
-                data = obs, actions, rewards, dones, action_log_probs, values, rnn_states_actor, rnn_states_critic
+                data = (
+                    obs,
+                    actions,
+                    rewards,
+                    terminated,
+                    truncated,
+                    infos,
+                    action_log_probs,
+                    values,
+                    rnn_states_actor,
+                    rnn_states_critic,
+                )
 
                 # insert data into buffer
                 self.insert(data)
@@ -81,17 +91,22 @@ class JSBSimRunner(Runner):
                                      self.num_env_steps,
                                      int(self.total_num_steps / (end - start))))
 
-                train_infos["average_episode_rewards"] = self.buffer.rewards.sum() / (self.buffer.masks == False).sum()
-                logging.info("average episode rewards is {}".format(train_infos["average_episode_rewards"]))
+                train_infos.update(self.rollout_reward_metrics())
+                if "average_episode_rewards" in train_infos:
+                    logging.info("average episode rewards is {}".format(train_infos["average_episode_rewards"]))
 
                 if len(heading_turns_list):
                     train_infos["average_heading_turns"] = np.mean(heading_turns_list)
                     logging.info("average heading turns is {}".format(train_infos["average_heading_turns"]))
                 self.log_info(train_infos, self.total_num_steps)
 
+            # Refresh the training population independently from evaluation.
+            if self.use_selfplay and episode % self.selfplay_interval == 0:
+                self.update_opponent_pool(episode)
+
             # eval
             if episode % self.eval_interval == 0 and episode != 0 and self.use_eval:
-                    self.eval(self.total_num_steps)
+                self.eval(self.total_num_steps)
 
             # save model
             if (episode % self.save_interval == 0) or (episode == episodes - 1):
@@ -99,7 +114,7 @@ class JSBSimRunner(Runner):
 
     def warmup(self):
         # reset env
-        obs = self.envs.reset()
+        obs, _ = self.envs.reset()
         self.buffer.step = 0
         self.buffer.obs[0] = obs.copy()
 
@@ -120,17 +135,66 @@ class JSBSimRunner(Runner):
         return values, actions, action_log_probs, rnn_states_actor, rnn_states_critic
 
     def insert(self, data: List[np.ndarray]):
-        obs, actions, rewards, dones, action_log_probs, values, rnn_states_actor, rnn_states_critic = data
-
-        dones_env = np.all(dones.squeeze(axis=-1), axis=-1)
-
-        rnn_states_actor[dones_env == True] = np.zeros(((dones_env == True).sum(), *rnn_states_actor.shape[1:]), dtype=np.float32)
-        rnn_states_critic[dones_env == True] = np.zeros(((dones_env == True).sum(), *rnn_states_critic.shape[1:]), dtype=np.float32)
+        (
+            obs,
+            actions,
+            rewards,
+            terminated,
+            truncated,
+            infos,
+            action_log_probs,
+            values,
+            rnn_states_actor,
+            rnn_states_critic,
+        ) = data
+        rewards = self._bootstrap_time_limits(
+            rewards, truncated, infos, rnn_states_critic
+        )
+        dones = np.logical_or(terminated, truncated).squeeze(axis=-1)
+        rnn_states_actor[dones] = 0.0
+        rnn_states_critic[dones] = 0.0
 
         masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
-        masks[dones_env == True] = np.zeros(((dones_env == True).sum(), self.num_agents, 1), dtype=np.float32)
+        masks[dones] = 0.0
+        bad_masks = np.ones_like(masks)
+        bad_masks[truncated.squeeze(axis=-1)] = 0.0
 
-        self.buffer.insert(obs, actions, rewards, masks, action_log_probs, values, rnn_states_actor, rnn_states_critic)
+        self.buffer.insert(
+            obs,
+            actions,
+            rewards,
+            masks,
+            action_log_probs,
+            values,
+            rnn_states_actor,
+            rnn_states_critic,
+            bad_masks,
+        )
+
+    @torch.no_grad()
+    def _bootstrap_time_limits(self, rewards, truncated, infos, rnn_states_critic):
+        if not self.all_args.use_proper_time_limits:
+            return rewards
+        rewards = rewards.copy()
+        controlled_agents = self.buffer.num_agents
+        for env_id, info in enumerate(infos):
+            truncated_agents = truncated[env_id, :controlled_agents, 0]
+            if not np.any(truncated_agents):
+                continue
+            final_obs = np.asarray(info["final_observation"])[
+                :controlled_agents
+            ]
+            bootstrap_values = self.policy.get_values(
+                final_obs,
+                rnn_states_critic[env_id],
+                np.ones((controlled_agents, 1), dtype=np.float32),
+            )
+            bootstrap_values = _t2n(bootstrap_values)
+            agent_ids = np.flatnonzero(truncated_agents)
+            rewards[env_id, agent_ids, 0] += (
+                self.all_args.gamma * bootstrap_values[agent_ids, 0]
+            )
+        return rewards
 
     @torch.no_grad()
     def eval(self, total_num_steps):
@@ -138,7 +202,7 @@ class JSBSimRunner(Runner):
         total_episodes, eval_episode_rewards = 0, []
         eval_cumulative_rewards = np.zeros((self.n_eval_rollout_threads, *self.buffer.rewards.shape[2:]), dtype=np.float32)
 
-        eval_obs = self.eval_envs.reset()
+        eval_obs, _ = self.eval_envs.reset()
         eval_masks = np.ones((self.n_eval_rollout_threads, *self.buffer.masks.shape[2:]), dtype=np.float32)
         eval_rnn_states = np.zeros((self.n_eval_rollout_threads, *self.buffer.rnn_states_actor.shape[2:]), dtype=np.float32)
 
@@ -157,7 +221,8 @@ class JSBSimRunner(Runner):
             eval_rnn_states = np.array(np.split(_t2n(eval_rnn_states), self.n_eval_rollout_threads))
 
             # Obser reward and next obs
-            eval_obs, eval_rewards, eval_dones, eval_infos = self.eval_envs.step(eval_actions)
+            eval_obs, eval_rewards, eval_terminated, eval_truncated, eval_infos = self.eval_envs.step(eval_actions)
+            eval_dones = np.logical_or(eval_terminated, eval_truncated)
 
             # real render with tacview
             if self.render_mode == "real_time" and self.tacview:
@@ -197,7 +262,7 @@ class JSBSimRunner(Runner):
     def render(self):
         logging.info("\nStart render, render mode is {self.render_mode} ... ...")
         render_episode_rewards = 0
-        render_obs = self.envs.reset()
+        render_obs, _ = self.envs.reset()
         render_masks = np.ones((1, *self.buffer.masks.shape[2:]), dtype=np.float32)
         render_rnn_states = np.zeros((1, *self.buffer.rnn_states_actor.shape[2:]), dtype=np.float32)
         self.envs.render(mode=self.render_mode, filepath=f'{self.run_dir}/{self.experiment_name}.txt.acmi',tacview=self.tacview)
@@ -211,7 +276,8 @@ class JSBSimRunner(Runner):
             render_rnn_states = np.expand_dims(_t2n(render_rnn_states), axis=0)
 
             # Obser reward and next obs
-            render_obs, render_rewards, render_dones, render_infos = self.envs.step(render_actions)
+            render_obs, render_rewards, render_terminated, render_truncated, render_infos = self.envs.step(render_actions)
+            render_dones = np.logical_or(render_terminated, render_truncated)
             if self.use_selfplay:
                 render_rewards = render_rewards[:, :self.num_agents // 2, ...]
             render_episode_rewards += render_rewards

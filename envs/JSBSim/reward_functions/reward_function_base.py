@@ -13,6 +13,7 @@ class BaseRewardFunction(ABC):
         # inner variables
         self.reward_scale = getattr(self.config, f'{self.__class__.__name__}_scale', 1.0)
         self.is_potential = getattr(self.config, f'{self.__class__.__name__}_potential', False)
+        self.gamma = getattr(self.config, 'reward_gamma', 0.99)
         self.pre_rewards = defaultdict(float)
         self.reward_trajectory = defaultdict(list)
         self.reward_item_names = [self.__class__.__name__]
@@ -28,7 +29,7 @@ class BaseRewardFunction(ABC):
         if self.is_potential:
             self.pre_rewards.clear()
             for agent_id in env.agents.keys():
-                self.pre_rewards[agent_id] = self.get_reward(task, env, agent_id)
+                self.get_reward(task, env, agent_id)
         self.reward_trajectory.clear()
 
     @abstractmethod
@@ -58,7 +59,10 @@ class BaseRewardFunction(ABC):
         """
         reward = new_reward * self.reward_scale
         if self.is_potential:
-            reward, self.pre_rewards[agent_id] = reward - self.pre_rewards[agent_id], reward
+            reward, self.pre_rewards[agent_id] = (
+                self.gamma * reward - self.pre_rewards[agent_id],
+                reward,
+            )
         self.reward_trajectory[agent_id].append([reward, *render_items])
         return reward
 

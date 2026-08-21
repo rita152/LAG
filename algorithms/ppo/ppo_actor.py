@@ -30,6 +30,8 @@ class PPOActor(nn.Module):
             input_size = self.rnn.output_size
         # (3) act module
         self.act = ACTLayer(act_space, input_size, self.act_hidden_size, self.activation_id, self.gain)
+        if self.use_prior and not self.act._shoot_action:
+            raise ValueError("--use-prior is only valid for a missile-shoot action space")
 
         self.to(device)
 

@@ -159,6 +159,8 @@ class HierarchicalSingleCombatDodgeMissileTask(HierarchicalSingleCombatTask, Sin
 
 
 class SingleCombatShootMissileTask(SingleCombatDodgeMissileTask):
+    shoot_state_size = 4
+
     def __init__(self, config):
         super().__init__(config)
 
@@ -170,14 +172,55 @@ class SingleCombatShootMissileTask(SingleCombatDodgeMissileTask):
         ]
 
     def load_observation_space(self):
-        self.observation_space = spaces.Box(low=-10, high=10., shape=(21,))
+        self.observation_space = spaces.Box(
+            low=-10, high=10., shape=(21 + self.shoot_state_size,)
+        )
 
     def load_action_space(self):
         # aileron, elevator, rudder, throttle, shoot control
         self.action_space = spaces.Tuple([spaces.MultiDiscrete([41, 41, 41, 30]), spaces.Discrete(2)])
     
     def get_obs(self, env, agent_id):
-        return super().get_obs(env, agent_id)
+        norm_obs = np.zeros(self.observation_space.shape[0])
+        norm_obs[:21] = super().get_obs(env, agent_id)
+        agent = env.agents[agent_id]
+        target, shoot_valid = self._get_shoot_target(env, agent_id)
+        max_missiles = max(agent.num_missiles, 1)
+        shoot_interval = env.current_step - self._last_shoot_time[agent_id]
+        cooldown = max(self.min_attack_interval - shoot_interval, 0)
+        norm_obs[-self.shoot_state_size:] = (
+            self.remaining_missiles[agent_id] / max_missiles,
+            cooldown / max(self.min_attack_interval, 1),
+            float(shoot_valid),
+            float(target is not None),
+        )
+        return norm_obs
+
+    def _get_shoot_target(self, env, agent_id):
+        agent = env.agents[agent_id]
+        alive_enemies = [enemy for enemy in agent.enemies if enemy.is_alive]
+        if not agent.is_alive or not alive_enemies:
+            return None, False
+        target = min(
+            alive_enemies,
+            key=lambda enemy: np.linalg.norm(enemy.get_position() - agent.get_position()),
+        )
+        offset = target.get_position() - agent.get_position()
+        distance = np.linalg.norm(offset)
+        heading = agent.get_velocity()
+        attack_angle = np.rad2deg(np.arccos(np.clip(
+            np.sum(offset * heading) / (distance * np.linalg.norm(heading) + 1e-8),
+            -1,
+            1,
+        )))
+        shoot_interval = env.current_step - self._last_shoot_time[agent_id]
+        valid = (
+            self.remaining_missiles[agent_id] > 0
+            and shoot_interval >= self.min_attack_interval
+            and attack_angle <= self.max_attack_angle
+            and distance <= self.max_attack_distance
+        )
+        return target, valid
     
     def normalize_action(self, env, agent_id, action):
         self._shoot_action[agent_id] = action[-1]
@@ -192,12 +235,14 @@ class SingleCombatShootMissileTask(SingleCombatDodgeMissileTask):
         SingleCombatTask.step(self, env)
         for agent_id, agent in env.agents.items():
             # [RL-based missile launch with limited condition]
-            shoot_flag = agent.is_alive and self._shoot_action[agent_id] and self.remaining_missiles[agent_id] > 0
+            target, shoot_valid = self._get_shoot_target(env, agent_id)
+            shoot_flag = bool(self._shoot_action[agent_id] and shoot_valid)
             if shoot_flag:
                 new_missile_uid = agent_id + str(self.remaining_missiles[agent_id])
                 env.add_temp_simulator(
-                    MissileSimulator.create(parent=agent, target=agent.enemies[0], uid=new_missile_uid))
+                    MissileSimulator.create(parent=agent, target=target, uid=new_missile_uid))
                 self.remaining_missiles[agent_id] -= 1
+                self._last_shoot_time[agent_id] = env.current_step
 
 
 class HierarchicalSingleCombatShootTask(HierarchicalSingleCombatTask, SingleCombatShootMissileTask):

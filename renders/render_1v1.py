@@ -45,7 +45,7 @@ enm_policy.load_state_dict(torch.load(enm_run_dir + f"/actor_{enm_policy_index}.
 
 
 print("Start render")
-obs = env.reset()
+obs, _ = env.reset()
 if render:
     env.render(mode='txt', filepath=f'{experiment_name}.txt.acmi')
 ego_rnn_states = np.zeros((1, 1, 128), dtype=np.float32)
@@ -62,7 +62,8 @@ while True:
     enm_rnn_states = _t2n(enm_rnn_states)
     actions = np.concatenate((ego_actions, enm_actions), axis=0)
     # Obser reward and next obs
-    obs, rewards, dones, infos = env.step(actions)
+    obs, rewards, terminated, truncated, infos = env.step(actions)
+    dones = np.logical_or(terminated, truncated)
     rewards = rewards[:num_agents // 2, ...]
     episode_rewards += rewards
     if render:

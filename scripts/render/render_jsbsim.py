@@ -44,7 +44,7 @@ def parse_args(args, parser):
                        help="number of fighters controlled by RL policy")
     group.add_argument('--num-agents', type=int, default=1,
                        help="number of fighters controlled by RL policy")
-    all_args = parser.parse_known_args(args)[0]
+    all_args = parser.parse_args(args)
     return all_args
 
 
@@ -70,7 +70,7 @@ def main(args):
         device = torch.device("cuda:0")  # use cude mask to control using which GPU
         torch.set_num_threads(all_args.n_training_threads)
         torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark = False
     else:
         logging.info("choose to use cpu...")
         device = torch.device("cpu")

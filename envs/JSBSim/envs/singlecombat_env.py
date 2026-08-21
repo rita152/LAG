@@ -34,12 +34,15 @@ class SingleCombatEnv(BaseEnv):
         else:
             raise NotImplementedError(f"Unknown taskname: {taskname}")
 
-    def reset(self) -> np.ndarray:
+    def reset(self, *, seed=None, options=None):
+        if seed is not None:
+            self.seed(seed)
         self.current_step = 0
         self.reset_simulators()
+        self._events = []
         self.task.reset(self)
         obs = self.get_obs()
-        return self._pack(obs)
+        return self._pack(obs), {}
 
     def reset_simulators(self):
         # switch side

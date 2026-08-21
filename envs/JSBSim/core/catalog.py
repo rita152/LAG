@@ -549,10 +549,17 @@ class MixedCatalog(dict):
         Args:
             jsbsim_props (list): list of 'name_jsbsim (access)' of jsbsim properties
         """
+        if isinstance(jsbsim_props, str):
+            jsbsim_props = jsbsim_props.splitlines()
         for jsbsim_prop in jsbsim_props:
             if jsbsim_prop.strip() == "":
                 continue  # skip empty line
-            [name_jsbsim, access] = jsbsim_prop.split(" ")
+            try:
+                name_jsbsim, access = jsbsim_prop.rsplit(maxsplit=1)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid JSBSim property catalog entry: {jsbsim_prop!r}"
+                ) from exc
             access = re.sub(r"[\(\)]", "", access)  # remove parenthesis from the flag
             name = re.sub(r"_$", "", re.sub(r"[\-/\]\[]+", "_", name_jsbsim))  # get property name from jsbsim name
             if name not in self:

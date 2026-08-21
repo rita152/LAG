@@ -83,7 +83,8 @@ class BaseSimulator(ABC):
         pass
 
     def __del__(self):
-        logging.debug(f"{self.__class__.__name__}:{self.uid} is deleted!")
+        uid = getattr(self, "_BaseSimulator__uid", "<uninitialized>")
+        logging.debug(f"{self.__class__.__name__}:{uid} is deleted!")
 
 
 class AircraftSimulator(BaseSimulator):
@@ -118,6 +119,7 @@ class AircraftSimulator(BaseSimulator):
         self.lon0, self.lat0, self.alt0 = origin
         self.bloods = 100
         self.__status = AircraftSimulator.ALIVE
+        self.death_event_reported = False
         for key, value in kwargs.items():
             if key == 'num_missiles':
                 self.num_missiles = value  # type: int
@@ -144,10 +146,12 @@ class AircraftSimulator(BaseSimulator):
         return self.__status == AircraftSimulator.SHOTDOWN
 
     def crash(self):
-        self.__status = AircraftSimulator.CRASH
+        if self.is_alive:
+            self.__status = AircraftSimulator.CRASH
 
     def shotdown(self):
-        self.__status = AircraftSimulator.SHOTDOWN
+        if self.is_alive:
+            self.__status = AircraftSimulator.SHOTDOWN
 
     def reload(self, new_state: Union[dict, None] = None, new_origin: Union[tuple, None] = None):
         """Reload aircraft simulator
@@ -157,12 +161,21 @@ class AircraftSimulator(BaseSimulator):
         # reset temp simulator links
         self.bloods = 100
         self.__status = AircraftSimulator.ALIVE
+        self.death_event_reported = False
         self.launch_missiles.clear()
         self.under_missiles.clear()
         self.num_left_missiles = self.num_missiles
 
         # load JSBSim FDM
-        self.jsbsim_exec = jsbsim.FGFDMExec(os.path.join(get_root_dir(), 'data'))
+        data_root = os.path.join(get_root_dir(), 'data')
+        model_path = os.path.join(data_root, 'aircraft', self.model, f'{self.model}.xml')
+        if not os.path.isfile(model_path):
+            raise FileNotFoundError(
+                f"JSBSim aircraft model is missing: {model_path}. "
+                "Clone the repository with --recurse-submodules or run "
+                "`git submodule update --init --recursive`."
+            )
+        self.jsbsim_exec = jsbsim.FGFDMExec(data_root)
         self.jsbsim_exec.set_debug_level(0)
         self.jsbsim_exec.load_model(self.model)
         Catalog.add_jsbsim_props(self.jsbsim_exec.query_property_catalog(""))
@@ -353,6 +366,7 @@ class MissileSimulator(BaseSimulator):
         self.parent_aircraft = None  # type: AircraftSimulator
         self.target_aircraft = None  # type: AircraftSimulator
         self.render_explosion = False
+        self.event_reported = False
 
         # missile parameters (for AIM-9L)
         self._g = 9.81      # gravitational acceleration
@@ -441,14 +455,23 @@ class MissileSimulator(BaseSimulator):
         self._distance_pre = np.inf
         self._distance_increment = deque(maxlen=int(5 / self.dt))  # 5s of distance increment -- can't hit
         self._left_t = int(1 / self.dt)  # remove missile 1s after its destroying
+        self.event_reported = False
 
     def target(self, target: AircraftSimulator):
         self.target_aircraft = target  # TODO: change target?
         self.target_aircraft.under_missiles.append(self)
 
     def run(self):
+        if self.is_done:
+            self._left_t = max(self._left_t - 1, 0)
+            return
         self._t += self.dt
         action, distance = self._guidance()
+        if not np.all(np.isfinite(action)) or not np.isfinite(distance):
+            raise FloatingPointError(
+                f"Non-finite missile guidance for {self.uid}: "
+                f"action={action}, distance={distance}"
+            )
         self._distance_increment.append(distance > self._distance_pre)
         self._distance_pre = distance
         if distance < self._Rc and self.target_aircraft.is_alive:
@@ -477,7 +500,16 @@ class MissileSimulator(BaseSimulator):
         return log_msg
 
     def close(self):
+        if self.parent_aircraft is not None and self in self.parent_aircraft.launch_missiles:
+            self.parent_aircraft.launch_missiles.remove(self)
+        if self.target_aircraft is not None and self in self.target_aircraft.under_missiles:
+            self.target_aircraft.under_missiles.remove(self)
+        self.parent_aircraft = None
         self.target_aircraft = None
+
+    @property
+    def should_remove(self):
+        return self.is_done and self._left_t <= 0
 
     def _guidance(self):
         """
@@ -485,8 +517,10 @@ class MissileSimulator(BaseSimulator):
         """
         x_m, y_m, z_m = self.get_position()
         dx_m, dy_m, dz_m = self.get_velocity()
+        eps = 1e-6
         v_m = np.linalg.norm([dx_m, dy_m, dz_m])
-        theta_m = np.arcsin(dz_m / v_m)
+        safe_v_m = max(v_m, eps)
+        theta_m = np.arcsin(np.clip(dz_m / safe_v_m, -1.0, 1.0))
         x_t, y_t, z_t = self.target_aircraft.get_position()
         dx_t, dy_t, dz_t = self.target_aircraft.get_velocity()
         Rxy = np.linalg.norm([x_m - x_t, y_m - y_t])  # distance from missile to target project to X-Y plane
@@ -494,9 +528,11 @@ class MissileSimulator(BaseSimulator):
         # calculate beta & eps, but no need actually...
         # beta = np.arctan2(y_m - y_t, x_m - x_t)  # relative yaw
         # eps = np.arctan2(z_m - z_t, np.linalg.norm([x_m - x_t, y_m - y_t]))  # relative pitch
-        dbeta = ((dy_t - dy_m) * (x_t - x_m) - (dx_t - dx_m) * (y_t - y_m)) / Rxy**2
+        safe_Rxy = max(Rxy, eps)
+        safe_Rxyz = max(Rxyz, eps)
+        dbeta = ((dy_t - dy_m) * (x_t - x_m) - (dx_t - dx_m) * (y_t - y_m)) / safe_Rxy**2
         deps = ((dz_t - dz_m) * Rxy**2 - (z_t - z_m) * (
-            (x_t - x_m) * (dx_t - dx_m) + (y_t - y_m) * (dy_t - dy_m))) / (Rxyz**2 * Rxy)
+            (x_t - x_m) * (dx_t - dx_m) + (y_t - y_m) * (dy_t - dy_m))) / (safe_Rxyz**2 * safe_Rxy)
         ny = self.K * v_m / self._g * np.cos(theta_m) * dbeta
         nz = self.K * v_m / self._g * deps + np.cos(theta_m)
         return np.clip([ny, nz], -self._nyz_max, self._nyz_max), Rxyz
@@ -517,8 +553,11 @@ class MissileSimulator(BaseSimulator):
         ny, nz = action
 
         dv = self._g * (nx - np.sin(theta))
-        self._dphi = self._g / v * (ny / np.cos(theta))
-        self._dtheta = self._g / v * (nz - np.cos(theta))
+        safe_v = max(abs(v), 1e-6)
+        cos_theta = np.cos(theta)
+        safe_cos_theta = np.copysign(max(abs(cos_theta), 1e-6), cos_theta)
+        self._dphi = self._g / safe_v * (ny / safe_cos_theta)
+        self._dtheta = self._g / safe_v * (nz - cos_theta)
 
         v += self.dt * dv
         phi += self.dt * self._dphi
@@ -528,6 +567,13 @@ class MissileSimulator(BaseSimulator):
             v * np.cos(theta) * np.sin(phi),
             v * np.sin(theta)
         ])
+        if not np.all(np.isfinite(np.concatenate((
+            self._position,
+            self._geodetic,
+            self._posture,
+            self._velocity,
+        )))):
+            raise FloatingPointError(f"Non-finite missile state for {self.uid}")
         self._posture[:] = np.array([0, theta, phi])
         # update mass
         if self._t < self._t_thrust:

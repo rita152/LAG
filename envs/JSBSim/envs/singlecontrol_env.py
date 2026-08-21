@@ -22,13 +22,16 @@ class SingleControlEnv(BaseEnv):
         else:
             raise NotImplementedError(f'Unknown taskname: {taskname}')
 
-    def reset(self):
+    def reset(self, *, seed=None, options=None):
+        if seed is not None:
+            self.seed(seed)
         self.current_step = 0
         self.reset_simulators()
+        self._events = []
         self.heading_turn_counts = 0
         self.task.reset(self)
         obs = self.get_obs()
-        return self._pack(obs)
+        return self._pack(obs), {}
 
     def reset_simulators(self):
         if self.init_states is None:
