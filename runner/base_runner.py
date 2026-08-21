@@ -202,6 +202,11 @@ class Runner(object):
             "policy_snapshots",
             "latest_elo",
             "current_opponent_ids",
+            "_episode_returns",
+            "_episode_agent_done",
+            "_team_episode_returns",
+            "_completed_agent_returns",
+            "_completed_team_returns",
         ):
             if hasattr(self, name):
                 extra[name] = getattr(self, name)
@@ -264,17 +269,99 @@ class Runner(object):
             return None
         return value
 
+    def reset_episode_metrics(self, preserve_completed=False):
+        """Reset accumulators when vector environments are explicitly reset."""
+        completed_agent_returns = (
+            list(getattr(self, "_completed_agent_returns", []))
+            if preserve_completed
+            else []
+        )
+        completed_team_returns = (
+            list(getattr(self, "_completed_team_returns", []))
+            if preserve_completed
+            else []
+        )
+        controlled_agents = int(self.buffer.num_agents)
+        shape = (self.n_rollout_threads, controlled_agents)
+        self._episode_returns = np.zeros(shape, dtype=np.float64)
+        self._episode_agent_done = np.zeros(shape, dtype=bool)
+        self._team_episode_returns = np.zeros(
+            self.n_rollout_threads, dtype=np.float64
+        )
+        self._completed_agent_returns = completed_agent_returns
+        self._completed_team_returns = completed_team_returns
+
+    def record_episode_metrics(self, rewards, terminated, truncated):
+        """Accumulate complete agent and team returns across rollout boundaries."""
+        rewards = np.asarray(rewards)
+        dones = np.logical_or(terminated, truncated)
+        if rewards.ndim == 2:
+            rewards = rewards[..., None]
+        if dones.ndim == 3 and dones.shape[-1] == 1:
+            dones = dones[..., 0]
+        if rewards.ndim != 3 or dones.ndim != 2:
+            raise ValueError(
+                "Episode metrics require rewards [env, agent, 1] and "
+                "termination flags [env, agent, 1]"
+            )
+
+        controlled_agents = int(self.buffer.num_agents)
+        controlled_rewards = rewards[:, :controlled_agents, 0]
+        controlled_dones = dones[:, :controlled_agents]
+        expected_shape = controlled_rewards.shape
+        if (
+            not hasattr(self, "_episode_returns")
+            or self._episode_returns.shape != expected_shape
+        ):
+            self.reset_episode_metrics()
+
+        active = ~self._episode_agent_done
+        self._episode_returns += controlled_rewards * active
+        self._team_episode_returns += controlled_rewards.mean(axis=1)
+
+        newly_done = controlled_dones & ~self._episode_agent_done
+        self._completed_agent_returns.extend(
+            self._episode_returns[newly_done].astype(float).tolist()
+        )
+        self._episode_returns[newly_done] = 0.0
+        self._episode_agent_done |= controlled_dones
+
+        env_done = np.all(dones, axis=1)
+        self._completed_team_returns.extend(
+            self._team_episode_returns[env_done].astype(float).tolist()
+        )
+        # VecEnv has already auto-reset completed environments. Clear latched
+        # per-agent state only at that boundary so repeated dead masks cannot be
+        # counted as additional episodes.
+        self._episode_returns[env_done] = 0.0
+        self._episode_agent_done[env_done] = False
+        self._team_episode_returns[env_done] = 0.0
+
     def rollout_reward_metrics(self):
-        """Return stable reward metrics even when no episode ends in a rollout."""
-        completed = int(np.count_nonzero(self.buffer.masks[1:] == 0))
+        """Return metrics based only on complete episodes seen so far."""
+        completed_agent_returns = list(
+            getattr(self, "_completed_agent_returns", [])
+        )
+        completed_team_returns = list(
+            getattr(self, "_completed_team_returns", [])
+        )
         metrics = {
             "rollout_average_step_reward": float(np.mean(self.buffer.rewards)),
-            "completed_agent_episodes": completed,
+            "completed_agent_episodes": len(completed_agent_returns),
+            "completed_env_episodes": len(completed_team_returns),
         }
-        if completed:
+        if completed_agent_returns:
             metrics["average_episode_rewards"] = float(
-                self.buffer.rewards.sum() / completed
+                np.mean(completed_agent_returns)
             )
+        if completed_team_returns:
+            metrics["average_team_episode_rewards"] = float(
+                np.mean(completed_team_returns)
+            )
+        if hasattr(self, "_completed_agent_returns"):
+            self._completed_agent_returns.clear()
+        if hasattr(self, "_completed_team_returns"):
+            self._completed_team_returns.clear()
         return metrics
         
     def render_with_tacview(self, data):

@@ -19,9 +19,26 @@ class BaseEnv(gymnasium.Env):
     aircraft control task with its own specific observation/action space and
     variables and agent_reward calculation.
     """
-    metadata = {"render_modes": ["human", "txt", "real_time"]}
+    metadata = {
+        "render_modes": ["txt", "real_time"],
+        "render_fps": 5,
+    }
 
-    def __init__(self, config_name: str):
+    def __init__(
+        self,
+        config_name: str,
+        render_mode=None,
+        render_path="./JSBSimRecording.txt.acmi",
+        tacview=None,
+    ):
+        if render_mode not in (None, *self.metadata["render_modes"]):
+            raise ValueError(
+                f"Unsupported render mode {render_mode!r}; expected one of "
+                f"{self.metadata['render_modes']}"
+            )
+        self.render_mode = render_mode
+        self.render_path = str(render_path)
+        self.tacview = tacview
         # basic args
         self.config = parse_config(config_name)
         self.max_steps = getattr(self.config, 'max_steps', 100)  # type: int
@@ -237,34 +254,31 @@ class BaseEnv(gymnasium.Env):
         self._jsbsims.clear()
         self._tempsims.clear()
 
-    def render(self, mode="txt", filepath='./JSBSimRecording.txt.acmi', tacview=None):
-        """Renders the environment.
+    def configure_render(self, render_mode, render_path=None, tacview=None):
+        """Configure rendering for internal runners before calling render()."""
+        if render_mode not in (None, *self.metadata["render_modes"]):
+            raise ValueError(
+                f"Unsupported render mode {render_mode!r}; expected one of "
+                f"{self.metadata['render_modes']}"
+            )
+        if render_path is not None and str(render_path) != self.render_path:
+            self.render_path = str(render_path)
+            self._create_records = False
+        self.render_mode = render_mode
+        self.tacview = tacview
 
-        The set of supported modes varies per environment. (And some
-
-        environments do not support rendering at all.) By convention,
-
-        if mode is:
-
-        - human: print on the terminal
-        - txt: output to txt.acmi files
-        - real_time: realtime render with tacview by socket comm
-
-        Note:
-
-            Make sure that your class's metadata 'render.modes' key includes
-              the list of supported modes. It's recommended to call super()
-              in implementations to use the functionality of this method.
-        :param mode: str, the mode to render with
-        """
-        if mode == "txt":
+    def render(self):
+        """Render using the mode selected at construction time."""
+        if self.render_mode is None:
+            return None
+        if self.render_mode == "txt":
             if not self._create_records:
-                with open(filepath, mode='w', encoding='utf-8-sig') as f:
+                with open(self.render_path, mode='w', encoding='utf-8-sig') as f:
                     f.write("FileType=text/acmi/tacview\n")
                     f.write("FileVersion=2.1\n")
                     f.write("0,ReferenceTime=2020-04-01T00:00:00Z\n")
                 self._create_records = True
-            with open(filepath, mode='a', encoding='utf-8-sig') as f:
+            with open(self.render_path, mode='a', encoding='utf-8-sig') as f:
                 timestamp = self.current_step * self.time_interval
                 f.write(f"#{timestamp:.2f}\n")
                 for sim in self._jsbsims.values():
@@ -275,7 +289,11 @@ class BaseEnv(gymnasium.Env):
                     log_msg = sim.log()
                     if log_msg is not None:
                         f.write(log_msg + "\n")
-        elif mode == "real_time":
+        elif self.render_mode == "real_time":
+            if self.tacview is None:
+                raise RuntimeError(
+                    "render_mode='real_time' requires a Tacview client"
+                )
             timestamp = self.current_step * self.time_interval
             data = [f"#{timestamp:.2f}\n"]
             for sim in self._jsbsims.values():
@@ -290,9 +308,7 @@ class BaseEnv(gymnasium.Env):
 
             data_str = "".join(data)
             # send data to tacview
-            tacview.send_data_to_client(data_str)
-        else:
-            raise NotImplementedError
+            self.tacview.send_data_to_client(data_str)
 
     def seed(self, seed=None):
         """

@@ -134,6 +134,7 @@ class SelfplayJSBSimRunner(JSBSimRunner):
     def warmup(self):
         # reset env
         obs, _ = self.envs.reset()
+        self.reset_episode_metrics()
         # [Selfplay] divide ego/opponent of initial obs
         self.opponent_obs = obs[:, self.num_agents // 2:, ...]
         obs = obs[:, :self.num_agents // 2, ...]
@@ -403,6 +404,7 @@ class SelfplayJSBSimRunner(JSBSimRunner):
 
         # reset env
         obs, _ = self.envs.reset()
+        self.reset_episode_metrics(preserve_completed=True)
         if self.num_opponents > 0:
             self.opponent_obs = obs[:, self.num_agents // 2:, ...]
             obs = obs[:, :self.num_agents // 2, ...]
@@ -423,7 +425,10 @@ class SelfplayJSBSimRunner(JSBSimRunner):
         logging.info("\nStart render ...")
         render_episode_rewards = 0
         render_obs, _ = self.envs.reset()
-        self.envs.render(mode='txt', filepath=f'{file_path}/{self.experiment_name}.txt.acmi')
+        self.envs.configure_render(
+            'txt', f'{file_path}/{self.experiment_name}.txt.acmi'
+        )
+        self.envs.render()
         render_masks = np.ones((1, *self.buffer.masks.shape[2:]), dtype=np.float32)
         render_rnn_states = np.zeros((1, *self.buffer.rnn_states_actor.shape[2:]), dtype=np.float32)
         render_opponent_obs = render_obs[:, self.num_agents // 2:, ...]
@@ -451,7 +456,7 @@ class SelfplayJSBSimRunner(JSBSimRunner):
             render_dones = np.logical_or(render_terminated, render_truncated)
             render_rewards = render_rewards[:, :self.num_agents // 2, ...]
             render_episode_rewards += render_rewards
-            self.envs.render(mode='txt', filepath=f'{file_path}/{self.experiment_name}.txt.acmi')
+            self.envs.render()
             if render_dones.all():
                 break
             render_opponent_obs = render_obs[:, self.num_agents // 2:, ...]

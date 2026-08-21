@@ -45,7 +45,11 @@ ego_run_dir = "/home/lqh/jyh/CloseAirCombat/scripts/results/MultipleCombat/2v2/N
 enm_run_dir = "/home/lqh/jyh/CloseAirCombat/scripts/results/SingleCombat/1v1/NoWeapon/HierarchySelfplay/ppo/artillery_check/wandb/latest-run/files"
 experiment_name = ego_run_dir.split('/')[-4]
 
-env = MultipleCombatEnv("2v2/NoWeapon/HierarchySelfplay")
+env = MultipleCombatEnv(
+    "2v2/NoWeapon/HierarchySelfplay",
+    render_mode="txt",
+    render_path=f"{experiment_name}.txt.acmi",
+)
 env.seed(0)
 args = Args()
 
@@ -60,7 +64,7 @@ enm_policy.load_state_dict(torch.load(enm_run_dir + f"/actor_{enm_policy_index}.
 print("Start render")
 obs, _ = env.reset()
 if render:
-    env.render(mode='txt', filepath=f'{experiment_name}.txt.acmi')
+    env.render()
 ego_rnn_states = np.zeros((1, 1, 128), dtype=np.float32)
 masks = np.ones((num_agents // 2, 1))
 enm_obs =  obs[num_agents // 2:, :]
@@ -88,7 +92,7 @@ while True:
     rewards = rewards[:num_agents // 2, ...]
     episode_rewards += rewards
     if render:
-        env.render(mode='txt', filepath=f'{experiment_name}.txt.acmi')
+        env.render()
     if dones.all():
         print(infos)
         break

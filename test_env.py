@@ -11,6 +11,7 @@ def test_env():
     envs = DummyVecEnv([lambda: SingleCombatEnv("1v1/NoWeapon/HierarchySelfplay") for _ in range(parallel_num)])
 
     observations, reset_infos = envs.reset()
+    envs.configure_render('txt', 'JSBSimRecording.txt.acmi')
     # DataType test
     obs_shape = (parallel_num, envs.num_agents, *envs.observation_space.shape)
     # act_shape = (parallel_num, envs.num_agents, *envs.action_space.shape)
@@ -30,7 +31,7 @@ def test_env():
         bloods = [envs.envs[0].agents[agent_id].bloods for agent_id in envs.envs[0].agents.keys()]
         print(f"step:{step}, bloods:{bloods}")
         episode_reward += rewards[:,0,:]
-        envs.render(mode='txt', filepath='JSBSimRecording.txt.acmi')
+        envs.render()
         # terminate if any of the parallel envs has been done
         if np.all(dones):
             print(episode_reward)
@@ -49,8 +50,9 @@ def test_multi_env():
 
     # DataType test
     obs, share_obs, reset_infos = envs.reset()
+    envs.configure_render('txt', 'JSBSimRecording.txt.acmi')
     step = 0
-    envs.render(mode='txt', filepath='JSBSimRecording.txt.acmi')
+    envs.render()
     assert obs.shape == obs_shape and share_obs.shape == share_obs_shape
     while True:
         actions = np.array([[envs.action_space.sample() for _ in range(envs.num_agents)] for _ in range(parallel_num)])
@@ -61,7 +63,7 @@ def test_multi_env():
         print(f"step:{step}, bloods:{bloods}")
         end = time.time()
         # print(rewards)
-        envs.render(mode='txt', filepath='JSBSimRecording.txt.acmi')
+        envs.render()
         assert obs.shape == obs_shape and share_obs.shape == share_obs_shape \
             and rewards.shape == reward_shape and dones.shape == done_shape
         if np.all(dones):

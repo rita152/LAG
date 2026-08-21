@@ -18,6 +18,26 @@ from config import get_config
 from scripts.train.train_jsbsim import make_train_env, parse_args
 
 
+def test_launcher_scripts_adapt_to_the_available_cpu_count():
+    scripts_dir = Path(__file__).resolve().parents[1] / "scripts"
+    training_scripts = (
+        "train_heading.sh",
+        "train_vsbaseline.sh",
+        "train_selfplay.sh",
+        "train_selfplay_shoot.sh",
+        "train_share_selfplay.sh",
+    )
+    for script_name in training_scripts:
+        script = (scripts_dir / script_name).read_text()
+        assert "N_ROLLOUT_THREADS" in script
+        assert "--n-rollout-threads ${rollout_threads}" in script
+        assert "--n-rollout-threads 20" not in script
+
+    for script_name in ("render_heading.sh", "human_free_fly.sh"):
+        script = (scripts_dir / script_name).read_text()
+        assert "--n-rollout-threads 1" in script
+
+
 class AffinityProbeEnv:
     observation_space = spaces.Box(low=-1, high=1, shape=(1,))
     action_space = spaces.Discrete(1)

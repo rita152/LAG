@@ -4,11 +4,13 @@ scenario="1/heading"
 algo="ppo"
 exp="v1"
 seed=5
+available_rollout_threads="$(python -c 'import os; available = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1); print(min(20, available))')"
+rollout_threads="${N_ROLLOUT_THREADS:-${available_rollout_threads}}"
 
 echo "env is ${env}, scenario is ${scenario}, algo is ${algo}, exp is ${exp}, seed is ${seed}"
 CUDA_VISIBLE_DEVICES=0 python train/train_jsbsim.py \
     --env-name ${env} --algorithm-name ${algo} --scenario-name ${scenario} --experiment-name ${exp} \
-    --seed ${seed} --n-training-threads 1 --n-rollout-threads 20 --cuda \
+    --seed ${seed} --n-training-threads 1 --n-rollout-threads ${rollout_threads} --cuda \
     --log-interval 1 --save-interval 1 \
     --num-mini-batch 5 --buffer-size 3000 --num-env-steps 1e8 \
     --lr 3e-4 --gamma 0.99 --ppo-epoch 4 --clip-param 0.2 --max-grad-norm 2 --entropy-coef 1e-3 \

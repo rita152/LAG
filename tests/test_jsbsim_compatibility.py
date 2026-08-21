@@ -7,6 +7,7 @@ from envs.JSBSim.core.catalog import MixedCatalog
 from envs.JSBSim.core.simulatior import MissileSimulator
 from envs.JSBSim.envs.env_base import BaseEnv
 from envs.JSBSim.envs.multiplecombat_env import MultipleCombatEnv
+from envs.JSBSim.envs.singlecontrol_env import SingleControlEnv
 from envs.JSBSim.reward_functions.posture_reward import PostureReward
 
 
@@ -34,6 +35,23 @@ def test_environment_pack_rejects_inf_without_entering_debugger():
 
     with pytest.raises(FloatingPointError, match="Non-finite"):
         env._pack({"A0100": np.array([np.inf], dtype=np.float32)})
+
+
+def test_environment_uses_constructor_render_mode_and_no_argument_render(
+    tmp_path,
+):
+    render_path = tmp_path / "heading.txt.acmi"
+    env = SingleControlEnv(
+        "1/heading", render_mode="txt", render_path=render_path
+    )
+    try:
+        env.reset(seed=5)
+        assert env.render() is None
+        recording = render_path.read_text(encoding="utf-8-sig")
+        assert recording.startswith("FileType=text/acmi/tacview")
+        assert "render_fps" in env.metadata
+    finally:
+        env.close()
 
 
 class _KinematicTarget:

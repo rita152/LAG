@@ -1,14 +1,24 @@
 import json
 import random
+from collections import deque
 from types import SimpleNamespace
 
+from gymnasium import spaces
 import numpy as np
 import torch
 
-from envs.JSBSim.tasks.multiplecombat_task import HierarchicalMultipleCombatTask
+from envs.JSBSim.reward_functions import EventDrivenReward
+from envs.JSBSim.tasks.multiplecombat_task import (
+    HierarchicalMultipleCombatTask,
+    MultipleCombatTask,
+)
+from envs.JSBSim.tasks.singlecombat_with_missle_task import (
+    SingleCombatDodgeMissileTask,
+)
 from envs.JSBSim.envs.multiplecombat_env import MultipleCombatEnv
 from algorithms.utils.selfplay import FSP, PFSP, SP
 from runner.base_runner import Runner
+from runner.jsbsim_runner import JSBSimRunner
 from runner.selfplay_jsbsim_runner import SelfplayJSBSimRunner
 
 
@@ -70,11 +80,51 @@ def test_rollout_reward_metrics_do_not_divide_by_zero():
 
     assert metrics["rollout_average_step_reward"] == 1.0
     assert metrics["completed_agent_episodes"] == 0
+    assert metrics["completed_env_episodes"] == 0
     assert "average_episode_rewards" not in metrics
 
 
-def _checkpoint_runner(directory, actor_value, optimizer_lr):
+def test_episode_returns_span_rollouts_and_ignore_repeated_dead_masks():
     runner = Runner.__new__(Runner)
+    runner.n_rollout_threads = 1
+    runner.buffer = SimpleNamespace(
+        num_agents=2,
+        rewards=np.ones((4, 1, 2, 1), dtype=np.float32),
+    )
+    runner.reset_episode_metrics()
+
+    def record(rewards, dones):
+        rewards = np.asarray(rewards, dtype=np.float32).reshape(1, 2, 1)
+        terminated = np.asarray(dones, dtype=bool).reshape(1, 2, 1)
+        runner.record_episode_metrics(
+            rewards, terminated, np.zeros_like(terminated)
+        )
+
+    record([1.0, 10.0], [False, False])
+    record([2.0, 20.0], [True, False])
+    record([0.0, 30.0], [True, False])
+
+    first_rollout = runner.rollout_reward_metrics()
+    assert first_rollout["completed_agent_episodes"] == 1
+    assert first_rollout["average_episode_rewards"] == 3.0
+    assert first_rollout["completed_env_episodes"] == 0
+
+    record([0.0, 40.0], [True, True])
+    second_rollout = runner.rollout_reward_metrics()
+    assert second_rollout["completed_agent_episodes"] == 1
+    assert second_rollout["average_episode_rewards"] == 100.0
+    assert second_rollout["completed_env_episodes"] == 1
+    assert second_rollout["average_team_episode_rewards"] == 51.5
+
+    drained = runner.rollout_reward_metrics()
+    assert drained["completed_agent_episodes"] == 0
+    assert drained["completed_env_episodes"] == 0
+
+
+def _checkpoint_runner(
+    directory, actor_value, optimizer_lr, runner_class=Runner
+):
+    runner = runner_class.__new__(runner_class)
     actor = torch.nn.Linear(1, 1)
     critic = torch.nn.Linear(1, 1)
     with torch.no_grad():
@@ -95,6 +145,129 @@ def _checkpoint_runner(directory, actor_value, optimizer_lr):
     runner.total_num_steps = 456
     runner.start_episode = 0
     return runner
+
+
+def test_ppo_runner_save_paths_write_resumable_checkpoints(tmp_path):
+    for runner_class in (JSBSimRunner, SelfplayJSBSimRunner):
+        save_dir = tmp_path / runner_class.__name__
+        save_dir.mkdir()
+        runner = _checkpoint_runner(
+            save_dir,
+            actor_value=2.0,
+            optimizer_lr=0.123,
+            runner_class=runner_class,
+        )
+
+        runner.save(episode=4)
+
+        checkpoint = torch.load(
+            save_dir / "training_state_latest.pt", weights_only=False
+        )
+        assert checkpoint["episode"] == 4
+        assert "optimizer" in checkpoint
+        assert (save_dir / "actor_latest.pt").is_file()
+        assert (save_dir / "critic_latest.pt").is_file()
+
+
+class _ConstantShapingReward:
+    def __init__(self, value):
+        self.value = value
+        self.calls = 0
+
+    def get_reward(self, task, env, agent_id):
+        self.calls += 1
+        return self.value
+
+
+def test_dead_multiple_combat_agent_receives_only_terminal_event_reward():
+    shaping = _ConstantShapingReward(50.0)
+    event_reward = EventDrivenReward(SimpleNamespace())
+    task = MultipleCombatTask.__new__(MultipleCombatTask)
+    task.reward_functions = [shaping, event_reward]
+    task._agent_die_flag = {}
+    env = SimpleNamespace(
+        agents={"A0100": SimpleNamespace(is_alive=False)},
+        _events=[
+            {
+                "type": "aircraft_shotdown",
+                "agent_id": "A0100",
+                "processed": False,
+            }
+        ],
+    )
+
+    reward, _ = task.get_reward(env, "A0100", info={})
+    env._events = [
+        {
+            "type": "missile_hit",
+            "agent_id": "A0100",
+            "processed": False,
+        }
+    ]
+    repeated_reward, _ = task.get_reward(env, "A0100", info={})
+
+    assert reward == -200.0
+    assert repeated_reward == 0.0
+    assert env._events[0]["processed"] is False
+    assert shaping.calls == 0
+
+
+class _DodgeAircraft:
+    def __init__(self, alive, state=None):
+        self.is_alive = alive
+        self.enemies = []
+        self._state = np.zeros(16) if state is None else np.asarray(state)
+
+    def get_property_values(self, variables):
+        return self._state
+
+    def get_position(self):
+        return np.zeros(3)
+
+    def get_velocity(self):
+        return np.array([200.0, 0.0, 0.0])
+
+    def check_missile_warning(self):
+        return None
+
+
+def test_dodge_task_masks_and_never_launches_at_dead_target():
+    target = _DodgeAircraft(alive=False)
+    agent = _DodgeAircraft(alive=True)
+    agent.enemies = [target]
+    task = SingleCombatDodgeMissileTask.__new__(
+        SingleCombatDodgeMissileTask
+    )
+    task.state_var = list(range(16))
+    task.observation_space = spaces.Box(
+        low=-10, high=10, shape=(task.base_obs_length,)
+    )
+    task.use_artillery = False
+    task.max_attack_angle = 180.0
+    task.max_attack_distance = np.inf
+    task.min_attack_interval = 0
+    task._last_shoot_time = {"A0100": 0}
+    task.remaining_missiles = {"A0100": 1}
+    task.lock_duration = {"A0100": deque([True], maxlen=1)}
+    created_missiles = []
+    env = SimpleNamespace(
+        agents={"A0100": agent},
+        center_lon=120.0,
+        center_lat=60.0,
+        center_alt=0.0,
+        current_step=1,
+        add_temp_simulator=created_missiles.append,
+    )
+
+    observation = task.get_obs(env, "A0100")
+    task.step(env)
+
+    assert observation.shape == (22,)
+    np.testing.assert_array_equal(observation[9:15], np.zeros(6))
+    assert observation[21] == 0.0
+    assert created_missiles == []
+    assert task.remaining_missiles["A0100"] == 1
+    assert len(task.lock_duration["A0100"]) == 0
 
 
 def test_checkpoint_restores_optimizer_rng_progress_and_selfplay_population(tmp_path):

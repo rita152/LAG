@@ -126,7 +126,19 @@ class MultipleCombatTask(SingleCombatTask):
         return norm_act
 
     def get_reward(self, env, agent_id, info: dict = ...) -> Tuple[float, dict]:
-        return super().get_reward(env, agent_id, info=info)
+        if self._agent_die_flag.get(agent_id, False):
+            return 0.0, info
+
+        reward = 0.0
+        agent_is_alive = env.agents[agent_id].is_alive
+        self._agent_die_flag[agent_id] = not agent_is_alive
+        for reward_function in self.reward_functions:
+            if not agent_is_alive and not isinstance(
+                reward_function, EventDrivenReward
+            ):
+                continue
+            reward += reward_function.get_reward(self, env, agent_id)
+        return reward, info
 
 
 class HierarchicalMultipleCombatTask(MultipleCombatTask):

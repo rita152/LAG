@@ -159,6 +159,7 @@ class ShareJSBSimRunner(Runner):
                     truncated,
                     infos,
                 ) = self.envs.step(actions)
+                self.record_episode_metrics(rewards, terminated, truncated)
 
                 data = (
                     obs,
@@ -217,6 +218,7 @@ class ShareJSBSimRunner(Runner):
     def warmup(self):
         # reset env
         obs, share_obs, _ = self.envs.reset()
+        self.reset_episode_metrics()
         # [Selfplay] divide ego/opponent of initial obs
         if self.use_selfplay:
             self.opponent_obs = obs[:, self.num_agents // 2:, ...]
@@ -496,7 +498,10 @@ class ShareJSBSimRunner(Runner):
         render_obs, render_share_obs, _ = self.envs.reset()
         render_masks = np.ones((1, *self.buffer.masks.shape[2:]), dtype=np.float32)
         render_rnn_states = np.zeros((1, *self.buffer.rnn_states_actor.shape[2:]), dtype=np.float32)
-        self.envs.render(mode='txt', filepath=f'{self.run_dir}/{self.experiment_name}.txt.acmi')
+        self.envs.configure_render(
+            'txt', f'{self.run_dir}/{self.experiment_name}.txt.acmi'
+        )
+        self.envs.render()
         if self.use_selfplay:
             policy_idx = self.render_opponent_index
             self._load_policy_snapshot(self.eval_opponent_policy, policy_idx)
@@ -540,7 +545,7 @@ class ShareJSBSimRunner(Runner):
             if self.use_selfplay:
                 render_rewards = render_rewards[:, :self.num_agents // 2, ...]
             render_episode_rewards += render_rewards
-            self.envs.render(mode='txt', filepath=f'{self.run_dir}/{self.experiment_name}.txt.acmi')
+            self.envs.render()
             if render_dones.all():
                 break
             if self.use_selfplay:
@@ -574,6 +579,7 @@ class ShareJSBSimRunner(Runner):
 
         # reset env
         obs, share_obs, _ = self.envs.reset()
+        self.reset_episode_metrics(preserve_completed=True)
         if self.all_args.n_choose_opponents > 0:
             self.opponent_obs = obs[:, self.num_agents // 2:, ...]
             obs = obs[:, :self.num_agents // 2, ...]

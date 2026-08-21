@@ -49,6 +49,7 @@ class JSBSimRunner(Runner):
 
                 # Obser reward and next obs
                 obs, rewards, terminated, truncated, infos = self.envs.step(actions)
+                self.record_episode_metrics(rewards, terminated, truncated)
 
                 # Extra recorded information
                 for info in infos:
@@ -115,6 +116,7 @@ class JSBSimRunner(Runner):
     def warmup(self):
         # reset env
         obs, _ = self.envs.reset()
+        self.reset_episode_metrics()
         self.buffer.step = 0
         self.buffer.obs[0] = obs.copy()
 
@@ -265,7 +267,12 @@ class JSBSimRunner(Runner):
         render_obs, _ = self.envs.reset()
         render_masks = np.ones((1, *self.buffer.masks.shape[2:]), dtype=np.float32)
         render_rnn_states = np.zeros((1, *self.buffer.rnn_states_actor.shape[2:]), dtype=np.float32)
-        self.envs.render(mode=self.render_mode, filepath=f'{self.run_dir}/{self.experiment_name}.txt.acmi',tacview=self.tacview)
+        self.envs.configure_render(
+            self.render_mode,
+            f'{self.run_dir}/{self.experiment_name}.txt.acmi',
+            self.tacview,
+        )
+        self.envs.render()
         while True:
             self.policy.prep_rollout()
             render_actions, render_rnn_states = self.policy.act(np.concatenate(render_obs),
@@ -281,7 +288,7 @@ class JSBSimRunner(Runner):
             if self.use_selfplay:
                 render_rewards = render_rewards[:, :self.num_agents // 2, ...]
             render_episode_rewards += render_rewards
-            self.envs.render(mode='txt', filepath=f'{self.run_dir}/{self.experiment_name}.txt.acmi')
+            self.envs.render()
             if render_dones.all():
                 break
         render_infos = {}
@@ -289,7 +296,4 @@ class JSBSimRunner(Runner):
         logging.info("render episode reward of agent: " + str(render_infos['render_episode_reward']))
 
     def save(self, episode):
-        policy_actor_state_dict = self.policy.actor.state_dict()
-        torch.save(policy_actor_state_dict, str(self.save_dir) + '/actor_latest.pt')
-        policy_critic_state_dict = self.policy.critic.state_dict()
-        torch.save(policy_critic_state_dict, str(self.save_dir) + '/critic_latest.pt')
+        return super().save(episode)

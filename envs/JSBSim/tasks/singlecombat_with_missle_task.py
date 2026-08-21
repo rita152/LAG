@@ -11,6 +11,9 @@ from ..utils.utils import LLA2NEU, get_AO_TA_R
 class SingleCombatDodgeMissileTask(SingleCombatTask):
     """This task aims at training agent to dodge missile attacking
     """
+    kinematic_obs_length = 21
+    base_obs_length = kinematic_obs_length + 1
+
     def __init__(self, config):
         super().__init__(config)
 
@@ -25,7 +28,9 @@ class SingleCombatDodgeMissileTask(SingleCombatTask):
         ]
 
     def load_observation_space(self):
-        self.observation_space = spaces.Box(low=-10, high=10., shape=(21,))
+        self.observation_space = spaces.Box(
+            low=-10, high=10., shape=(self.base_obs_length,)
+        )
 
     def get_obs(self, env, agent_id):
         """
@@ -57,15 +62,15 @@ class SingleCombatDodgeMissileTask(SingleCombatTask):
             - [18] ego_TA
             - [19] relative distance
             - [20] side flag
+        - target status
+            - [21] enemy alive flag
         """
-        norm_obs = np.zeros(21)
+        norm_obs = np.zeros(self.base_obs_length)
         ego_obs_list = np.array(env.agents[agent_id].get_property_values(self.state_var))
-        enm_obs_list = np.array(env.agents[agent_id].enemies[0].get_property_values(self.state_var))
+        target_aircraft = env.agents[agent_id].enemies[0]
         # (0) extract feature: [north(km), east(km), down(km), v_n(mh), v_e(mh), v_d(mh)]
         ego_cur_ned = LLA2NEU(*ego_obs_list[:3], env.center_lon, env.center_lat, env.center_alt)
-        enm_cur_ned = LLA2NEU(*enm_obs_list[:3], env.center_lon, env.center_lat, env.center_alt)
         ego_feature = np.array([*ego_cur_ned, *ego_obs_list[6:9]])
-        enm_feature = np.array([*enm_cur_ned, *enm_obs_list[6:9]])
         # (1) ego info normalization
         norm_obs[0] = ego_obs_list[2] / 5000
         norm_obs[1] = np.sin(ego_obs_list[3])
@@ -76,14 +81,26 @@ class SingleCombatDodgeMissileTask(SingleCombatTask):
         norm_obs[6] = ego_obs_list[10] / 340
         norm_obs[7] = ego_obs_list[11] / 340
         norm_obs[8] = ego_obs_list[12] / 340
-        # (2) relative enm info
-        ego_AO, ego_TA, R, side_flag = get_AO_TA_R(ego_feature, enm_feature, return_side=True)
-        norm_obs[9] = (enm_obs_list[9] - ego_obs_list[9]) / 340
-        norm_obs[10] = (enm_obs_list[2] - ego_obs_list[2]) / 1000
-        norm_obs[11] = ego_AO
-        norm_obs[12] = ego_TA
-        norm_obs[13] = R / 10000
-        norm_obs[14] = side_flag
+        # (2) relative enemy info. A dead target has an explicit zero slot
+        # instead of a frozen kinematic state.
+        if target_aircraft.is_alive:
+            enm_obs_list = np.array(
+                target_aircraft.get_property_values(self.state_var)
+            )
+            enm_cur_ned = LLA2NEU(
+                *enm_obs_list[:3], env.center_lon, env.center_lat, env.center_alt
+            )
+            enm_feature = np.array([*enm_cur_ned, *enm_obs_list[6:9]])
+            ego_AO, ego_TA, R, side_flag = get_AO_TA_R(
+                ego_feature, enm_feature, return_side=True
+            )
+            norm_obs[9] = (enm_obs_list[9] - ego_obs_list[9]) / 340
+            norm_obs[10] = (enm_obs_list[2] - ego_obs_list[2]) / 1000
+            norm_obs[11] = ego_AO
+            norm_obs[12] = ego_TA
+            norm_obs[13] = R / 10000
+            norm_obs[14] = side_flag
+            norm_obs[21] = 1.0
         # (3) relative missile info
         missile_sim = env.agents[agent_id].check_missile_warning()
         if missile_sim is not None:
@@ -109,19 +126,23 @@ class SingleCombatDodgeMissileTask(SingleCombatTask):
         SingleCombatTask.step(self, env)
         for agent_id, agent in env.agents.items():
             # [Rule-based missile launch]
-            target = agent.enemies[0].get_position() - agent.get_position()
+            target_aircraft = agent.enemies[0]
+            if not agent.is_alive or not target_aircraft.is_alive:
+                self.lock_duration[agent_id].clear()
+                continue
+            target = target_aircraft.get_position() - agent.get_position()
             heading = agent.get_velocity()
             distance = np.linalg.norm(target)
             attack_angle = np.rad2deg(np.arccos(np.clip(np.sum(target * heading) / (distance * np.linalg.norm(heading) + 1e-8), -1, 1)))
             self.lock_duration[agent_id].append(attack_angle < self.max_attack_angle)
             shoot_interval = env.current_step - self._last_shoot_time[agent_id]
 
-            shoot_flag = agent.is_alive and np.sum(self.lock_duration[agent_id]) >= self.lock_duration[agent_id].maxlen \
+            shoot_flag = np.sum(self.lock_duration[agent_id]) >= self.lock_duration[agent_id].maxlen \
                 and distance <= self.max_attack_distance and self.remaining_missiles[agent_id] > 0 and shoot_interval >= self.min_attack_interval
             if shoot_flag:
                 new_missile_uid = agent_id + str(self.remaining_missiles[agent_id])
                 env.add_temp_simulator(
-                    MissileSimulator.create(parent=agent, target=agent.enemies[0], uid=new_missile_uid))
+                    MissileSimulator.create(parent=agent, target=target_aircraft, uid=new_missile_uid))
                 self.remaining_missiles[agent_id] -= 1
                 self._last_shoot_time[agent_id] = env.current_step
 
@@ -173,7 +194,9 @@ class SingleCombatShootMissileTask(SingleCombatDodgeMissileTask):
 
     def load_observation_space(self):
         self.observation_space = spaces.Box(
-            low=-10, high=10., shape=(21 + self.shoot_state_size,)
+            low=-10,
+            high=10.,
+            shape=(self.kinematic_obs_length + self.shoot_state_size,),
         )
 
     def load_action_space(self):
@@ -182,7 +205,9 @@ class SingleCombatShootMissileTask(SingleCombatDodgeMissileTask):
     
     def get_obs(self, env, agent_id):
         norm_obs = np.zeros(self.observation_space.shape[0])
-        norm_obs[:21] = super().get_obs(env, agent_id)
+        norm_obs[:self.kinematic_obs_length] = super().get_obs(
+            env, agent_id
+        )[:self.kinematic_obs_length]
         agent = env.agents[agent_id]
         target, shoot_valid = self._get_shoot_target(env, agent_id)
         max_missiles = max(agent.num_missiles, 1)

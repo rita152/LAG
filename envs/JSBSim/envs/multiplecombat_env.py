@@ -9,8 +9,15 @@ class MultipleCombatEnv(BaseEnv):
     """
     MultipleCombatEnv is an multi-player competitive environment.
     """
-    def __init__(self, config_name: str):
-        super().__init__(config_name)
+    def __init__(
+        self, config_name: str, render_mode=None, render_path=None, tacview=None
+    ):
+        super().__init__(
+            config_name,
+            render_mode=render_mode,
+            render_path=render_path or "./JSBSimRecording.txt.acmi",
+            tacview=tacview,
+        )
         # Env-Specific initialization here!
         self._create_records = False
         self.training_mode = True

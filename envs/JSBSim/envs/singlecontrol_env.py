@@ -7,8 +7,15 @@ class SingleControlEnv(BaseEnv):
     """
     SingleControlEnv is an fly-control env for single agent with no enemy fighters.
     """
-    def __init__(self, config_name: str):
-        super().__init__(config_name)
+    def __init__(
+        self, config_name: str, render_mode=None, render_path=None, tacview=None
+    ):
+        super().__init__(
+            config_name,
+            render_mode=render_mode,
+            render_path=render_path or "./JSBSimRecording.txt.acmi",
+            tacview=tacview,
+        )
         # Env-Specific initialization here!
         assert len(self.agents.keys()) == 1, f"{self.__class__.__name__} only supports 1 aircraft!"
         self.init_states = None

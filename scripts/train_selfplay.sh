@@ -4,11 +4,13 @@ scenario="1v1/NoWeapon/Selfplay"
 algo="ppo"
 exp="v1"
 seed=1
+available_rollout_threads="$(python -c 'import os; available = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1); print(min(20, available))')"
+rollout_threads="${N_ROLLOUT_THREADS:-${available_rollout_threads}}"
 
 echo "env is ${env}, scenario is ${scenario}, algo is ${algo}, exp is ${exp}, seed is ${seed}"
 CUDA_VISIBLE_DEVICES=1 python train/train_jsbsim.py \
     --env-name ${env} --algorithm-name ${algo} --scenario-name ${scenario} --experiment-name ${exp} \
-    --seed ${seed} --n-training-threads 1 --n-rollout-threads 20 --cuda --log-interval 1 --save-interval 1 \
+    --seed ${seed} --n-training-threads 1 --n-rollout-threads ${rollout_threads} --cuda --log-interval 1 --save-interval 1 \
     --use-selfplay --selfplay-algorithm "fsp" --n-choose-opponents 1 \
     --use-eval --n-eval-rollout-threads 1 --eval-interval 1 --eval-episodes 1 \
     --num-mini-batch 5 --buffer-size 3000 --num-env-steps 1e8 \

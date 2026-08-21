@@ -110,7 +110,10 @@ class ManeuverAgent(BaselineAgent):
 
 
 def test_maneuver():
-    env = SingleCombatEnv(config_name='1v1/DodgeMissile/Selfplay')
+    env = SingleCombatEnv(
+        config_name='1v1/DodgeMissile/Selfplay',
+        render_mode='txt',
+    )
     env.seed(0)
     obs, _ = env.reset()
     env.render()
